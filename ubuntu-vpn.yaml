@@ -35,11 +35,11 @@ provision:
         less \
         htop
 
-      # Install FortiClient VPN (official Fortinet repo for Ubuntu 22.04/24.04)
-      wget -O - https://repo.fortinet.com/repo/forticlient/7.4/ubuntu22/DEB-GPG-KEY | gpg --dearmor | tee /usr/share/keyrings/repo.fortinet.com.gpg > /dev/null
-      echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/repo.fortinet.com.gpg] https://repo.fortinet.com/repo/forticlient/7.4/ubuntu22/ stable non-free' > /etc/apt/sources.list.d/repo.fortinet.com.list
-      apt-get update
-      apt-get install -y forticlient
+      # Install FortiClient VPN-only (free standalone version from official Fortinet download)
+      # https://www.fortinet.com/support/product-downloads -> FortiClient VPN-only -> Linux .deb
+      wget -O /tmp/forticlient-vpn.deb 'https://links.fortinet.com/forticlient/deb/vpnagent'
+      dpkg -i /tmp/forticlient-vpn.deb || apt-get install -f -y
+      rm /tmp/forticlient-vpn.deb
 
       # Install and configure Squid proxy
       apt-get install -y squid
