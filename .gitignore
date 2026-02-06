@@ -1,2 +1,5 @@
 # VPN credentials - do not commit
 vpn-config.json
+
+# Certificate fingerprint (host-specific)
+.vpn-cert-fingerprint

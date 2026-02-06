@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VM_NAME="ubuntu-vpn"
 VM_CONFIG="$SCRIPT_DIR/ubuntu-vpn.yaml"
 VPN_CONFIG="${VPN_CONFIG:-$SCRIPT_DIR/vpn-config.json}"
+CERT_FINGERPRINT_FILE="$SCRIPT_DIR/.vpn-cert-fingerprint"
 
 usage() {
     echo "Usage: $0 {start|stop|restart|shell|ssh|status|delete|vpn-connect|vpn-disconnect|vpn-status}"
@@ -152,6 +153,50 @@ read_vpn_config() {
     fi
 }
 
+check_certificate_fingerprint() {
+    local new_fingerprint="$1"
+    local saved_fingerprint=""
+
+    if [[ -f "$CERT_FINGERPRINT_FILE" ]]; then
+        saved_fingerprint=$(cat "$CERT_FINGERPRINT_FILE")
+    fi
+
+    if [[ -z "$saved_fingerprint" ]]; then
+        echo ""
+        echo "New VPN server certificate detected:"
+        echo "  Fingerprint (SHA1): $new_fingerprint"
+        echo ""
+        read -p "Trust this certificate and save fingerprint? (y/n) [n]: " response
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            echo "$new_fingerprint" > "$CERT_FINGERPRINT_FILE"
+            echo "Certificate fingerprint saved."
+            return 0
+        else
+            echo "Certificate rejected. Aborting connection."
+            return 1
+        fi
+    elif [[ "$saved_fingerprint" != "$new_fingerprint" ]]; then
+        echo ""
+        echo "WARNING: VPN server certificate has CHANGED!"
+        echo "  Saved fingerprint:  $saved_fingerprint"
+        echo "  New fingerprint:    $new_fingerprint"
+        echo ""
+        echo "This could indicate a man-in-the-middle attack or a legitimate certificate update."
+        read -p "Accept the new certificate? (y/n) [n]: " response
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            echo "$new_fingerprint" > "$CERT_FINGERPRINT_FILE"
+            echo "New certificate fingerprint saved."
+            return 0
+        else
+            echo "Certificate rejected. Aborting connection."
+            return 1
+        fi
+    else
+        echo "Certificate fingerprint verified."
+        return 0
+    fi
+}
+
 vpn_connect() {
     check_lima
     read_vpn_config
@@ -180,8 +225,46 @@ expect {
 "
     echo "$edit_script" | limactl shell "$VM_NAME" -- expect -f - >/dev/null 2>&1
 
-    # Connect using the profile
+    # First attempt to connect and capture certificate info
+    local connect_output
     local connect_script="
+set timeout 60
+log_user 1
+spawn /opt/forticlient/forticlient-cli vpn connect vpn-tunnel --user=${VPN_USERNAME} -p
+expect {
+    \"Password:\" {
+        send \"${VPN_PASSWORD}\r\"
+        exp_continue
+    }
+    \"Please input password\" {
+        send \"${VPN_PASSWORD}\r\"
+        exp_continue
+    }
+    -re \"Fingerprint \\\\(SHA1\\\\): (\[0-9A-Fa-f:\]+)\" {
+        set fingerprint \$expect_out(1,string)
+        puts \"CERT_FINGERPRINT::\$fingerprint\"
+        exp_continue
+    }
+    \"Confirm (y/n)\" {
+        send \"n\r\"
+    }
+    eof
+}
+"
+    connect_output=$(echo "$connect_script" | limactl shell "$VM_NAME" -- expect -f - 2>&1)
+
+    # Extract fingerprint from output
+    local cert_fingerprint
+    cert_fingerprint=$(echo "$connect_output" | grep -oP 'CERT_FINGERPRINT::\K[0-9A-Fa-f:]+' || true)
+
+    if [[ -n "$cert_fingerprint" ]]; then
+        # Certificate confirmation was requested - verify fingerprint
+        if ! check_certificate_fingerprint "$cert_fingerprint"; then
+            return 1
+        fi
+
+        # Reconnect and accept the certificate
+        local reconnect_script="
 set timeout 60
 spawn /opt/forticlient/forticlient-cli vpn connect vpn-tunnel --user=${VPN_USERNAME} -p
 expect {
@@ -200,7 +283,11 @@ expect {
     eof
 }
 "
-    echo "$connect_script" | limactl shell "$VM_NAME" -- expect -f -
+        echo "$reconnect_script" | limactl shell "$VM_NAME" -- expect -f -
+    else
+        # No certificate prompt - just show the output
+        echo "$connect_output"
+    fi
 
     echo ""
     echo "VPN connected. Use proxy at http://127.0.0.1:3128 to access VPN resources."
