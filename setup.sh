@@ -158,7 +158,7 @@ vpn_connect() {
 
     echo "Connecting to VPN: $VPN_GATEWAY:$VPN_PORT as $VPN_USERNAME..."
 
-    # Generate XML config for FortiClient
+    # Generate XML config for FortiClient VPN-only
     local xml_config="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <forticlient_configuration>
   <vpn>
@@ -180,8 +180,16 @@ vpn_connect() {
     # Import the config into FortiClient (run as non-root)
     echo "$xml_config" | limactl shell "$VM_NAME" -- bash -c "cat > /tmp/vpn-config.xml && /opt/forticlient/forticlient-cli vpn import /tmp/vpn-config.xml 2>/dev/null || true"
 
-    # Connect using the imported profile, passing password via stdin (run as non-root)
-    echo "$VPN_PASSWORD" | limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn connect vpn-tunnel --username="$VPN_USERNAME"
+    # Connect using the imported profile
+    # FortiClient VPN-only uses --user and -p flag which prompts for password
+    # Use expect to automate the password prompt
+    limactl shell "$VM_NAME" -- expect -c "
+        set timeout 60
+        spawn /opt/forticlient/forticlient-cli vpn connect vpn-tunnel --user=$VPN_USERNAME -p
+        expect \"Please input password.\"
+        send \"$VPN_PASSWORD\r\"
+        expect eof
+    "
 
     echo ""
     echo "VPN connected. Use proxy at http://127.0.0.1:3128 to access VPN resources."

@@ -33,7 +33,8 @@ provision:
         gnupg \
         vim \
         less \
-        htop
+        htop \
+        expect
 
       # Install FortiClient VPN-only (free standalone version from official Fortinet download)
       # https://www.fortinet.com/support/product-downloads -> FortiClient VPN-only -> Linux .deb
