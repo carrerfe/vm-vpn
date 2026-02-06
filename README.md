@@ -41,23 +41,42 @@ brew install lima jq
 ## Architecture
 
 ```
-                         Host Machine
-                              │
-                              │ HTTP/HTTPS requests
-                              ▼
-┌─────────────────────────────┼───────────┐
-│              Lima VM        │           │
-│           (Ubuntu 24.04 LTS)│           │
-│                     ┌───────┴────────┐  │
-│                     │  Proxy Server  │  │
-│                     │  (e.g. Squid)  │  │
-│                     └───────┬────────┘  │
-│  ┌─────────────┐            │           │
-│  │ FortiClient │◀───────────┘           │
-│  │    VPN      │────────▶ VPN Network   │
-│  └─────────────┘                        │
-└─────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                         Host Machine                             │
+│                                                                  │
+│  ┌──────────┐                                                    │
+│  │ Firefox  │──┐                                                 │
+│  │ (vmvpn)  │  │                                                 │
+│  └──────────┘  │                                                 │
+│                │                                                 │
+│  ┌──────────┐  │  SOCKS5 (localhost:1080)                        │
+│  │  curl    │──┼─────────────────────────────┐                   │
+│  │  apps    │  │                             │                   │
+│  └──────────┘  │  HTTP (localhost:3128)      │                   │
+│                └─────────────────────────┐   │                   │
+└──────────────────────────────────────────┼───┼───────────────────┘
+                                           │   │
+┌──────────────────────────────────────────┼───┼───────────────────┐
+│              Lima VM (Ubuntu 24.04 LTS)  │   │                   │
+│                                          ▼   ▼                   │
+│  ┌───────────────────────┐    ┌─────────────────────────────┐    │
+│  │     Squid Proxy       │    │   SSH Dynamic Port Forward  │    │
+│  │   (HTTP/HTTPS proxy)  │    │      (SOCKS5 proxy)         │    │
+│  │     port 3128         │    │       port 1080             │    │
+│  └───────────┬───────────┘    └──────────────┬──────────────┘    │
+│              │                               │                   │
+│              └───────────┬───────────────────┘                   │
+│                          ▼                                       │
+│                 ┌─────────────────┐                              │
+│                 │  FortiClient    │                              │
+│                 │     VPN         │────────▶ Corporate Network   │
+│                 └─────────────────┘                              │
+└──────────────────────────────────────────────────────────────────┘
 ```
+
+**SOCKS5 Proxy** (recommended): SSH dynamic port forwarding (`ssh -D`). Runs on host, tunnels through VM. Best for browsers.
+
+**HTTP Proxy**: Squid running inside the VM. Useful for apps that only support HTTP proxies or environment variables.
 
 ## Quick Start
 
