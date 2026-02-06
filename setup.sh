@@ -133,8 +133,12 @@ read_proxy_config() {
     # Proxy settings from config
     SOCKS_PROXY_ENABLED=$(jq -r '.socks_proxy.enabled // true' "$VPN_CONFIG")
     SOCKS_PROXY_PORT=$(jq -r '.socks_proxy.port // 1080' "$VPN_CONFIG")
+    SOCKS_PROXY_AUTO_START=$(jq -r '.socks_proxy.auto_start // true' "$VPN_CONFIG")
+    SOCKS_PROXY_AUTO_STOP=$(jq -r '.socks_proxy.auto_stop // true' "$VPN_CONFIG")
     HTTP_PROXY_ENABLED=$(jq -r '.http_proxy.enabled // false' "$VPN_CONFIG")
     HTTP_PROXY_PORT=$(jq -r '.http_proxy.port // 3128' "$VPN_CONFIG")
+    HTTP_PROXY_AUTO_START=$(jq -r '.http_proxy.auto_start // false' "$VPN_CONFIG")
+    HTTP_PROXY_AUTO_STOP=$(jq -r '.http_proxy.auto_stop // false' "$VPN_CONFIG")
 }
 
 read_vpn_config() {
@@ -371,19 +375,19 @@ stop_socks_proxy() {
 }
 
 start_proxies() {
-    if [[ "$SOCKS_PROXY_ENABLED" == "true" ]]; then
+    if [[ "$SOCKS_PROXY_ENABLED" == "true" && "$SOCKS_PROXY_AUTO_START" == "true" ]]; then
         echo "Starting SOCKS5 proxy on localhost:$SOCKS_PROXY_PORT..."
         start_socks_proxy "$SOCKS_PROXY_PORT"
     fi
     
-    # HTTP proxy (Squid) is already running in the VM, just report if enabled
-    if [[ "$HTTP_PROXY_ENABLED" == "true" ]]; then
+    # HTTP proxy (Squid) is already running in the VM, just report if enabled and auto_start
+    if [[ "$HTTP_PROXY_ENABLED" == "true" && "$HTTP_PROXY_AUTO_START" == "true" ]]; then
         echo "HTTP proxy available on localhost:$HTTP_PROXY_PORT"
     fi
 }
 
 stop_proxies() {
-    if [[ "$SOCKS_PROXY_ENABLED" == "true" ]]; then
+    if [[ "$SOCKS_PROXY_ENABLED" == "true" && "$SOCKS_PROXY_AUTO_STOP" == "true" ]]; then
         stop_socks_proxy "$SOCKS_PROXY_PORT"
     fi
 }

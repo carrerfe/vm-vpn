@@ -4,10 +4,14 @@
   "username": "your-username",
   "socks_proxy": {
     "enabled": true,
-    "port": 1080
+    "port": 1080,
+    "auto_start": true,
+    "auto_stop": true
   },
   "http_proxy": {
     "enabled": false,
-    "port": 3128
+    "port": 3128,
+    "auto_start": false,
+    "auto_stop": false
   }
 }
