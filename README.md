@@ -1,4 +1,4 @@
-# uvpn - Ubuntu VPN CLI
+# VM VPN
 
 A Lima-based Ubuntu 24.04 LTS virtual machine for running FortiClient VPN with proxy servers accessible from the host machine.
 
@@ -59,26 +59,26 @@ cp vpn-config.json.example vpn-config.json
 # Edit vpn-config.json with your credentials
 
 # 2. Connect to VPN (auto-starts VM and proxies)
-./uvpn vpn-connect
+./vmvpn vpn-connect
 
 # 3. Launch Firefox with VPN proxy
-./uvpn firefox
+./vmvpn firefox
 
 # 4. Check status
-./uvpn vpn-status
+./vmvpn vpn-status
 
 # 5. Disconnect when done
-./uvpn vpn-disconnect
+./vmvpn vpn-disconnect
 ```
 
 ## Shell Completion
 
 ```bash
 # Bash - add to ~/.bashrc
-eval "$(./uvpn completion bash)"
+eval "$(./vmvpn completion bash)"
 
 # Zsh - add to ~/.zshrc
-eval "$(./uvpn completion zsh)"
+eval "$(./vmvpn completion zsh)"
 ```
 
 ## Commands
@@ -117,8 +117,8 @@ eval "$(./uvpn completion zsh)"
 
 ```
 .
-├── uvpn                    # CLI script
-├── ubuntu-vpn.yaml         # Lima VM configuration
+├── vmvpn                   # CLI script
+├── vmvpn.yaml              # Lima VM configuration
 ├── vpn-config.json.example # VPN config template
 ├── vpn-config.json         # Your VPN credentials (gitignored)
 └── README.md
@@ -171,7 +171,7 @@ Create `vpn-config.json` with your VPN and proxy settings:
 If you prefer to connect manually inside the VM:
 
 ```bash
-./uvpn shell
+./vmvpn shell
 
 # Then inside the VM (run as non-root user):
 /opt/forticlient/forticlient-cli vpn connect <profile-name> --username=<username>
@@ -215,17 +215,17 @@ The easiest way to browse through the VPN:
 
 ```bash
 # Launch Firefox with pre-configured proxy profile
-./uvpn firefox
+./vmvpn firefox
 
 # View profile info and deletion instructions
-./uvpn firefox-profile
+./vmvpn firefox-profile
 ```
 
-This creates a dedicated `ubuntu-vpn` Firefox profile with proxy settings matching your config.
+This creates a dedicated `vmvpn` Firefox profile with proxy settings matching your config.
 
 ## Customization
 
-Edit `ubuntu-vpn.yaml` to customize:
+Edit `vmvpn.yaml` to customize:
 
 ```yaml
 cpus: 2          # Number of CPUs
