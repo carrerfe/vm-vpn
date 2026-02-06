@@ -490,8 +490,10 @@ create_firefox_profile() {
         exit 1
     fi
     
-    # Create profile if it doesn't exist
-    if ! firefox -P "$FIREFOX_PROFILE_NAME" -no-remote -headless -CreateProfile "$FIREFOX_PROFILE_NAME" 2>/dev/null; then
+    # Create profile if it doesn't exist (without making it default)
+    # Using -CreateProfile with just the name creates it without setting as default
+    # We avoid using -P during creation as that can affect default profile selection
+    if ! firefox -no-remote -headless -CreateProfile "$FIREFOX_PROFILE_NAME" 2>/dev/null; then
         # Profile might already exist, that's fine
         true
     fi
@@ -501,8 +503,8 @@ create_firefox_profile() {
     profile_path=$(get_firefox_profile_path)
     
     if [[ -z "$profile_path" || ! -d "$profile_path" ]]; then
-        # Create profile explicitly
-        firefox -CreateProfile "$FIREFOX_PROFILE_NAME" 2>/dev/null || true
+        # Create profile explicitly (without -P to avoid making it default)
+        firefox -no-remote -CreateProfile "$FIREFOX_PROFILE_NAME" 2>/dev/null || true
         sleep 1
         profile_path=$(get_firefox_profile_path)
     fi
