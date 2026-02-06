@@ -71,22 +71,27 @@ brew install lima
 
 ## Setup Script Commands
 
-| Command   | Description                    |
-|-----------|--------------------------------|
-| `start`   | Create and start the VM        |
-| `stop`    | Stop the VM                    |
-| `restart` | Restart the VM                 |
-| `shell`   | Open a shell in the VM         |
-| `ssh`     | Connect via SSH                |
-| `status`  | Show VM status                 |
-| `delete`  | Delete the VM and all its data |
+| Command          | Description                              |
+|------------------|------------------------------------------|
+| `start`          | Create and start the VM                  |
+| `stop`           | Stop the VM                              |
+| `restart`        | Restart the VM                           |
+| `shell`          | Open a shell in the VM                   |
+| `ssh`            | Connect via SSH                          |
+| `status`         | Show VM status                           |
+| `delete`         | Delete the VM and all its data           |
+| `vpn-connect`    | Connect to VPN using vpn-config.json     |
+| `vpn-disconnect` | Disconnect from VPN                      |
+| `vpn-status`     | Show VPN connection status               |
 
 ## Project Structure
 
 ```
 .
-├── ubuntu-vpn.yaml   # Lima VM configuration
-├── setup.sh          # Management script
+├── ubuntu-vpn.yaml         # Lima VM configuration
+├── setup.sh                # Management script
+├── vpn-config.json.example # VPN config template
+├── vpn-config.json         # Your VPN credentials (gitignored)
 └── README.md
 ```
 
@@ -101,22 +106,50 @@ brew install lima
 
 ## FortiClient VPN Usage
 
-Once inside the VM, use the FortiClient CLI:
+### Quick Connect (Recommended)
 
+1. Create your VPN config file:
 ```bash
-# Connect to VPN
-sudo /opt/forticlient/fortivpn connect <vpn-name> --server=<server> --user=<username>
-
-# Disconnect
-sudo /opt/forticlient/fortivpn disconnect
-
-# Check status
-sudo /opt/forticlient/fortivpn status
+cp vpn-config.json.example vpn-config.json
+# Edit vpn-config.json with your credentials
 ```
 
-Or use the GUI (requires X11 forwarding or desktop environment):
+2. Connect/disconnect using the setup script:
 ```bash
-/opt/forticlient/forticlient
+# Connect to VPN
+./setup.sh vpn-connect
+
+# Check VPN status
+./setup.sh vpn-status
+
+# Disconnect from VPN
+./setup.sh vpn-disconnect
+```
+
+### VPN Config File
+
+Create `vpn-config.json` with your VPN settings:
+
+```json
+{
+  "gateway": "vpn.example.com",
+  "port": 443,
+  "username": "your-username",
+  "password": "your-password"
+}
+```
+
+> **Note:** `vpn-config.json` is gitignored to protect your credentials.
+
+### Manual Connection (Inside VM)
+
+If you prefer to connect manually inside the VM:
+
+```bash
+./setup.sh shell
+
+# Then inside the VM:
+sudo /opt/forticlient/fortivpn connect vpn-tunnel --server=vpn.example.com:443 --user=username
 ```
 
 ## Proxy Server
