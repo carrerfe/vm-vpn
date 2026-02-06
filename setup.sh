@@ -6,10 +6,9 @@ VM_NAME="ubuntu-vpn"
 VM_CONFIG="$SCRIPT_DIR/ubuntu-vpn.yaml"
 VPN_CONFIG="${VPN_CONFIG:-$SCRIPT_DIR/vpn-config.json}"
 CERT_FINGERPRINT_FILE="$SCRIPT_DIR/.vpn-cert-fingerprint"
-SOCKS_PORT="${SOCKS_PORT:-1080}"
 
 usage() {
-    echo "Usage: $0 {start|stop|restart|shell|ssh|status|delete|vpn-connect|vpn-disconnect|vpn-status|proxy}"
+    echo "Usage: $0 {start|stop|restart|shell|ssh|status|delete|vpn-connect|vpn-disconnect|vpn-status}"
     echo ""
     echo "Commands:"
     echo "  start          Create and start the VM"
@@ -19,15 +18,12 @@ usage() {
     echo "  ssh            Connect via SSH"
     echo "  status         Show VM status"
     echo "  delete         Delete the VM completely"
-    echo "  vpn-connect    Connect to VPN using config from vpn-config.json"
-    echo "  vpn-disconnect Disconnect from VPN"
-    echo "  vpn-status     Show VPN connection status"
-    echo "  proxy          Start SOCKS5 proxy on localhost:1080 (for browsers)"
-    echo "  proxy-stop     Stop SOCKS5 proxy"
+    echo "  vpn-connect    Connect to VPN (auto-starts VM and proxies per config)"
+    echo "  vpn-disconnect Disconnect from VPN (stops proxies)"
+    echo "  vpn-status     Show VPN and proxy status"
     echo ""
     echo "Environment variables:"
     echo "  VPN_CONFIG     Path to VPN config JSON file (default: ./vpn-config.json)"
-    echo "  SOCKS_PORT     SOCKS5 proxy port (default: 1080)"
     exit 1
 }
 
@@ -130,9 +126,20 @@ check_vpn_config() {
     fi
 }
 
-read_vpn_config() {
+read_proxy_config() {
     check_jq
     check_vpn_config
+    
+    # Proxy settings from config
+    SOCKS_PROXY_ENABLED=$(jq -r '.socks_proxy.enabled // true' "$VPN_CONFIG")
+    SOCKS_PROXY_PORT=$(jq -r '.socks_proxy.port // 1080' "$VPN_CONFIG")
+    HTTP_PROXY_ENABLED=$(jq -r '.http_proxy.enabled // false' "$VPN_CONFIG")
+    HTTP_PROXY_PORT=$(jq -r '.http_proxy.port // 3128' "$VPN_CONFIG")
+}
+
+read_vpn_config() {
+    read_proxy_config
+    
     VPN_GATEWAY=$(jq -r '.gateway' "$VPN_CONFIG")
     VPN_PORT=$(jq -r '.port // 443' "$VPN_CONFIG")
     VPN_USERNAME=$(jq -r '.username' "$VPN_CONFIG")
@@ -201,9 +208,22 @@ check_certificate_fingerprint() {
     fi
 }
 
-vpn_connect() {
+ensure_vm_running() {
     check_lima
+    
+    # Check if VM exists and is running
+    if ! limactl list -q 2>/dev/null | grep -q "^${VM_NAME}$"; then
+        echo "VM not found. Creating and starting..."
+        limactl start --name="$VM_NAME" "$VM_CONFIG"
+    elif ! limactl list 2>/dev/null | grep "^${VM_NAME}" | grep -q "Running"; then
+        echo "Starting VM..."
+        limactl start "$VM_NAME"
+    fi
+}
+
+vpn_connect() {
     read_vpn_config
+    ensure_vm_running
 
     echo "Connecting to VPN: $VPN_GATEWAY:$VPN_PORT as $VPN_USERNAME..."
 
@@ -297,58 +317,96 @@ expect {
         echo "$connect_output"
     fi
 
+    # Start proxies if configured
+    start_proxies
+
     echo ""
-    echo "VPN connected. Use proxy at http://127.0.0.1:3128 to access VPN resources."
+    echo "VPN connected."
+    if [[ "$SOCKS_PROXY_ENABLED" == "true" ]]; then
+        echo "  SOCKS5 proxy: localhost:$SOCKS_PROXY_PORT"
+    fi
+    if [[ "$HTTP_PROXY_ENABLED" == "true" ]]; then
+        echo "  HTTP proxy:   localhost:$HTTP_PROXY_PORT"
+    fi
 }
 
 vpn_disconnect() {
+    read_proxy_config
     check_lima
+    
+    # Stop proxies
+    echo "Stopping proxies..."
+    stop_proxies
+    
     echo "Disconnecting from VPN..."
     limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn disconnect 2>/dev/null || true
     echo "VPN disconnected."
 }
 
 vpn_status() {
-    check_lima
-    echo "VPN status:"
-    limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn status 2>/dev/null || echo "VPN is not connected."
-}
-
-start_proxy() {
+    read_proxy_config
     check_lima
     
+    echo "VPN status:"
+    limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn status 2>/dev/null || echo "VPN is not connected."
+    
+    show_proxy_status
+}
+
+start_socks_proxy() {
+    local port="$1"
+    
     # Check if SOCKS proxy is already running
-    if pgrep -f "ssh.*-D.*$SOCKS_PORT.*lima-$VM_NAME" > /dev/null 2>&1; then
-        echo "SOCKS5 proxy already running on localhost:$SOCKS_PORT"
+    if pgrep -f "ssh.*-D.*127.0.0.1:$port.*lima-$VM_NAME" > /dev/null 2>&1; then
         return 0
     fi
     
     local ssh_config="$HOME/.lima/$VM_NAME/ssh.config"
-    if [[ ! -f "$ssh_config" ]]; then
-        echo "Error: VM is not running. Start it first with: $0 start"
-        exit 1
-    fi
-    
-    echo "Starting SOCKS5 proxy on localhost:$SOCKS_PORT..."
-    ssh -F "$ssh_config" -D "127.0.0.1:$SOCKS_PORT" -N -f lima-$VM_NAME
-    
-    echo ""
-    echo "SOCKS5 proxy started on localhost:$SOCKS_PORT"
-    echo ""
-    echo "Configure Firefox:"
-    echo "  1. Settings -> Network Settings -> Manual proxy configuration"
-    echo "  2. SOCKS Host: 127.0.0.1, Port: $SOCKS_PORT"
-    echo "  3. Select 'SOCKS v5'"
-    echo "  4. Check 'Proxy DNS when using SOCKS v5'"
-    echo ""
-    echo "Or use with curl:"
-    echo "  curl --socks5-hostname 127.0.0.1:$SOCKS_PORT https://example.com"
+    ssh -F "$ssh_config" -D "127.0.0.1:$port" -N -f lima-$VM_NAME 2>/dev/null
 }
 
-stop_proxy() {
-    echo "Stopping SOCKS5 proxy..."
-    pkill -f "ssh.*-D.*$SOCKS_PORT.*lima-$VM_NAME" 2>/dev/null || true
-    echo "SOCKS5 proxy stopped."
+stop_socks_proxy() {
+    local port="$1"
+    pkill -f "ssh.*-D.*127.0.0.1:$port.*lima-$VM_NAME" 2>/dev/null || true
+}
+
+start_proxies() {
+    if [[ "$SOCKS_PROXY_ENABLED" == "true" ]]; then
+        echo "Starting SOCKS5 proxy on localhost:$SOCKS_PROXY_PORT..."
+        start_socks_proxy "$SOCKS_PROXY_PORT"
+    fi
+    
+    # HTTP proxy (Squid) is already running in the VM, just report if enabled
+    if [[ "$HTTP_PROXY_ENABLED" == "true" ]]; then
+        echo "HTTP proxy available on localhost:$HTTP_PROXY_PORT"
+    fi
+}
+
+stop_proxies() {
+    if [[ "$SOCKS_PROXY_ENABLED" == "true" ]]; then
+        stop_socks_proxy "$SOCKS_PROXY_PORT"
+    fi
+}
+
+show_proxy_status() {
+    echo ""
+    echo "Proxy status:"
+    
+    if [[ "$SOCKS_PROXY_ENABLED" == "true" ]]; then
+        if pgrep -f "ssh.*-D.*127.0.0.1:$SOCKS_PROXY_PORT.*lima-$VM_NAME" > /dev/null 2>&1; then
+            echo "  SOCKS5 proxy: running on localhost:$SOCKS_PROXY_PORT"
+        else
+            echo "  SOCKS5 proxy: not running (configured on port $SOCKS_PROXY_PORT)"
+        fi
+    else
+        echo "  SOCKS5 proxy: disabled"
+    fi
+    
+    if [[ "$HTTP_PROXY_ENABLED" == "true" ]]; then
+        echo "  HTTP proxy:   available on localhost:$HTTP_PROXY_PORT"
+    else
+        echo "  HTTP proxy:   disabled"
+    fi
 }
 
 case "${1:-}" in
@@ -381,12 +439,6 @@ case "${1:-}" in
         ;;
     vpn-status)
         vpn_status
-        ;;
-    proxy)
-        start_proxy
-        ;;
-    proxy-stop)
-        stop_proxy
         ;;
     *)
         usage

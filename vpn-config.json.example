@@ -1,5 +1,13 @@
 {
   "gateway": "vpn.example.com",
   "port": 443,
-  "username": "your-username"
+  "username": "your-username",
+  "socks_proxy": {
+    "enabled": true,
+    "port": 1080
+  },
+  "http_proxy": {
+    "enabled": false,
+    "port": 3128
+  }
 }
