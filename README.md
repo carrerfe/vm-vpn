@@ -134,10 +134,11 @@ Create `vpn-config.json` with your VPN settings:
 {
   "gateway": "vpn.example.com",
   "port": 443,
-  "username": "your-username",
-  "password": "your-password"
+  "username": "your-username"
 }
 ```
+
+The `password` field is optional. If omitted, you'll be prompted to enter it interactively (hidden input).
 
 > **Note:** `vpn-config.json` is gitignored to protect your credentials.
 

@@ -131,7 +131,7 @@ read_vpn_config() {
     VPN_GATEWAY=$(jq -r '.gateway' "$VPN_CONFIG")
     VPN_PORT=$(jq -r '.port // 443' "$VPN_CONFIG")
     VPN_USERNAME=$(jq -r '.username' "$VPN_CONFIG")
-    VPN_PASSWORD=$(jq -r '.password' "$VPN_CONFIG")
+    VPN_PASSWORD=$(jq -r '.password // empty' "$VPN_CONFIG")
 
     if [[ -z "$VPN_GATEWAY" || "$VPN_GATEWAY" == "null" ]]; then
         echo "Error: 'gateway' is required in $VPN_CONFIG"
@@ -141,9 +141,14 @@ read_vpn_config() {
         echo "Error: 'username' is required in $VPN_CONFIG"
         exit 1
     fi
-    if [[ -z "$VPN_PASSWORD" || "$VPN_PASSWORD" == "null" ]]; then
-        echo "Error: 'password' is required in $VPN_CONFIG"
-        exit 1
+    # If password is not in config, prompt for it interactively
+    if [[ -z "$VPN_PASSWORD" ]]; then
+        read -s -p "VPN Password for $VPN_USERNAME: " VPN_PASSWORD
+        echo ""
+        if [[ -z "$VPN_PASSWORD" ]]; then
+            echo "Error: Password cannot be empty"
+            exit 1
+        fi
     fi
 }
 

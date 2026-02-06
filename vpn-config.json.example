@@ -1,6 +1,5 @@
 {
   "gateway": "vpn.example.com",
   "port": 443,
-  "username": "your-username",
-  "password": "your-password"
+  "username": "your-username"
 }
