@@ -6,9 +6,10 @@ VM_NAME="ubuntu-vpn"
 VM_CONFIG="$SCRIPT_DIR/ubuntu-vpn.yaml"
 VPN_CONFIG="${VPN_CONFIG:-$SCRIPT_DIR/vpn-config.json}"
 CERT_FINGERPRINT_FILE="$SCRIPT_DIR/.vpn-cert-fingerprint"
+SOCKS_PORT="${SOCKS_PORT:-1080}"
 
 usage() {
-    echo "Usage: $0 {start|stop|restart|shell|ssh|status|delete|vpn-connect|vpn-disconnect|vpn-status}"
+    echo "Usage: $0 {start|stop|restart|shell|ssh|status|delete|vpn-connect|vpn-disconnect|vpn-status|proxy}"
     echo ""
     echo "Commands:"
     echo "  start          Create and start the VM"
@@ -21,9 +22,12 @@ usage() {
     echo "  vpn-connect    Connect to VPN using config from vpn-config.json"
     echo "  vpn-disconnect Disconnect from VPN"
     echo "  vpn-status     Show VPN connection status"
+    echo "  proxy          Start SOCKS5 proxy on localhost:1080 (for browsers)"
+    echo "  proxy-stop     Stop SOCKS5 proxy"
     echo ""
     echo "Environment variables:"
     echo "  VPN_CONFIG     Path to VPN config JSON file (default: ./vpn-config.json)"
+    echo "  SOCKS_PORT     SOCKS5 proxy port (default: 1080)"
     exit 1
 }
 
@@ -306,6 +310,43 @@ vpn_status() {
     limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn status 2>/dev/null || echo "VPN is not connected."
 }
 
+start_proxy() {
+    check_lima
+    
+    # Check if SOCKS proxy is already running
+    if pgrep -f "ssh.*-D.*$SOCKS_PORT.*lima-$VM_NAME" > /dev/null 2>&1; then
+        echo "SOCKS5 proxy already running on localhost:$SOCKS_PORT"
+        return 0
+    fi
+    
+    local ssh_config="$HOME/.lima/$VM_NAME/ssh.config"
+    if [[ ! -f "$ssh_config" ]]; then
+        echo "Error: VM is not running. Start it first with: $0 start"
+        exit 1
+    fi
+    
+    echo "Starting SOCKS5 proxy on localhost:$SOCKS_PORT..."
+    ssh -F "$ssh_config" -D "127.0.0.1:$SOCKS_PORT" -N -f lima-$VM_NAME
+    
+    echo ""
+    echo "SOCKS5 proxy started on localhost:$SOCKS_PORT"
+    echo ""
+    echo "Configure Firefox:"
+    echo "  1. Settings -> Network Settings -> Manual proxy configuration"
+    echo "  2. SOCKS Host: 127.0.0.1, Port: $SOCKS_PORT"
+    echo "  3. Select 'SOCKS v5'"
+    echo "  4. Check 'Proxy DNS when using SOCKS v5'"
+    echo ""
+    echo "Or use with curl:"
+    echo "  curl --socks5-hostname 127.0.0.1:$SOCKS_PORT https://example.com"
+}
+
+stop_proxy() {
+    echo "Stopping SOCKS5 proxy..."
+    pkill -f "ssh.*-D.*$SOCKS_PORT.*lima-$VM_NAME" 2>/dev/null || true
+    echo "SOCKS5 proxy stopped."
+}
+
 case "${1:-}" in
     start)
         start
@@ -336,6 +377,12 @@ case "${1:-}" in
         ;;
     vpn-status)
         vpn_status
+        ;;
+    proxy)
+        start_proxy
+        ;;
+    proxy-stop)
+        stop_proxy
         ;;
     *)
         usage

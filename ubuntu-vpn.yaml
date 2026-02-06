@@ -76,10 +76,20 @@ provision:
       request_header_access Via deny all
       request_header_access X-Forwarded-For deny all
       request_header_access Proxy-Connection deny all
-      request_header_access Cache-Control deny all
       reply_header_access Via deny all
       reply_header_access X-Cache deny all
       reply_header_access X-Cache-Lookup deny all
+
+      # WebSocket support - allow upgrade headers
+      request_header_access Upgrade allow all
+      request_header_access Connection allow all
+      request_header_access Sec-WebSocket-Key allow all
+      request_header_access Sec-WebSocket-Version allow all
+      request_header_access Sec-WebSocket-Extensions allow all
+      request_header_access Sec-WebSocket-Protocol allow all
+      reply_header_access Upgrade allow all
+      reply_header_access Connection allow all
+      reply_header_access Sec-WebSocket-Accept allow all
       SQUIDCONF
 
       systemctl enable squid
