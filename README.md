@@ -11,6 +11,14 @@ This project provides:
 - **Firefox Integration**: Dedicated browser profile with auto-configured proxy
 - **Full VM**: Real Linux kernel, systemd, complete Ubuntu environment
 
+## Installation
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/carrerfe/vm-vpn/main/install.sh | bash
+```
+
+This installs to `~/.local/bin`. Set `VMVPN_INSTALL_DIR` to customize.
+
 ## Requirements
 
 - [Lima](https://lima-vm.io/) - Linux virtual machines on Linux/macOS
