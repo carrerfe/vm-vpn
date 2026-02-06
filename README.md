@@ -149,14 +149,14 @@ If you prefer to connect manually inside the VM:
 ```bash
 ./setup.sh shell
 
-# Then inside the VM:
-sudo /opt/forticlient/forticlient-cli vpn connect <profile-name> --username=<username>
+# Then inside the VM (run as non-root user):
+/opt/forticlient/forticlient-cli vpn connect <profile-name> --username=<username>
 
 # List VPN profiles
-sudo /opt/forticlient/forticlient-cli vpn list
+/opt/forticlient/forticlient-cli vpn list
 
 # Check status
-sudo /opt/forticlient/forticlient-cli vpn status
+/opt/forticlient/forticlient-cli vpn status
 ```
 
 ## Proxy Server

@@ -177,11 +177,11 @@ vpn_connect() {
   </vpn>
 </forticlient_configuration>"
 
-    # Import the config into FortiClient
-    echo "$xml_config" | limactl shell "$VM_NAME" -- bash -c "cat > /tmp/vpn-config.xml && sudo /opt/forticlient/forticlient-cli vpn import /tmp/vpn-config.xml 2>/dev/null || true"
+    # Import the config into FortiClient (run as non-root)
+    echo "$xml_config" | limactl shell "$VM_NAME" -- bash -c "cat > /tmp/vpn-config.xml && /opt/forticlient/forticlient-cli vpn import /tmp/vpn-config.xml 2>/dev/null || true"
 
-    # Connect using the imported profile, passing password via stdin
-    echo "$VPN_PASSWORD" | limactl shell "$VM_NAME" -- sudo /opt/forticlient/forticlient-cli vpn connect vpn-tunnel --username="$VPN_USERNAME"
+    # Connect using the imported profile, passing password via stdin (run as non-root)
+    echo "$VPN_PASSWORD" | limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn connect vpn-tunnel --username="$VPN_USERNAME"
 
     echo ""
     echo "VPN connected. Use proxy at http://127.0.0.1:3128 to access VPN resources."
@@ -190,14 +190,14 @@ vpn_connect() {
 vpn_disconnect() {
     check_lima
     echo "Disconnecting from VPN..."
-    limactl shell "$VM_NAME" -- sudo /opt/forticlient/forticlient-cli vpn disconnect 2>/dev/null || true
+    limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn disconnect 2>/dev/null || true
     echo "VPN disconnected."
 }
 
 vpn_status() {
     check_lima
     echo "VPN status:"
-    limactl shell "$VM_NAME" -- sudo /opt/forticlient/forticlient-cli vpn status 2>/dev/null || echo "VPN is not connected."
+    limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn status 2>/dev/null || echo "VPN is not connected."
 }
 
 case "${1:-}" in
