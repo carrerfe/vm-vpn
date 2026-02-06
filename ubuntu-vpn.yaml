@@ -1,0 +1,63 @@
+vmType: "qemu"
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+cpus: 2
+memory: "4GiB"
+disk: "20GiB"
+
+mounts: []
+
+containerd:
+  system: false
+  user: false
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+
+      apt-get update
+      apt-get install -y \
+        curl \
+        wget \
+        net-tools \
+        iputils-ping \
+        iproute2 \
+        ca-certificates \
+        gnupg \
+        vim \
+        less \
+        htop
+
+probes:
+  - script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      if ! timeout 30s bash -c "until command -v curl >/dev/null 2>&1; do sleep 3; done"; then
+        echo >&2 "curl is not installed yet"
+        exit 1
+      fi
+    hint: Waiting for provisioning to complete
+
+hostResolver:
+  enabled: true
+  hosts:
+    host.lima.internal: host.lima.internal
+
+networks:
+  - lima: user-v2
+
+message: |
+  Ubuntu 24.04 LTS VM for FortiClient VPN is ready!
+  
+  To access the VM:
+    limactl shell ubuntu-vpn
+  
+  Or via SSH:
+    ssh -F ~/.lima/ubuntu-vpn/ssh.config lima-ubuntu-vpn
