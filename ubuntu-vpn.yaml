@@ -46,13 +46,9 @@ provision:
       apt-get install -y squid
 
       cat > /etc/squid/conf.d/vpn-proxy.conf << 'SQUIDCONF'
-      # Allow connections from Lima host network
-      acl localnet src 192.168.0.0/16
-      acl localnet src 10.0.0.0/8
-      acl localnet src 172.16.0.0/12
-
-      # Allow localhost
+      # Only allow localhost connections
       acl localhost src 127.0.0.1/32
+      acl localhost src ::1
 
       # Allow SSL ports
       acl SSL_ports port 443
@@ -64,13 +60,12 @@ provision:
       # Allow CONNECT for SSL
       acl CONNECT method CONNECT
 
-      # Access rules
+      # Access rules - localhost only
       http_access allow localhost
-      http_access allow localnet
       http_access deny all
 
-      # Listen on all interfaces, port 3128
-      http_port 0.0.0.0:3128
+      # Listen on localhost only, port 3128
+      http_port 127.0.0.1:3128
 
       # Disable caching (we just want to proxy)
       cache deny all
