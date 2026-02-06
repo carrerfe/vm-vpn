@@ -69,6 +69,17 @@ provision:
 
       # Disable caching (we just want to proxy)
       cache deny all
+
+      # Anonymous proxy - hide all proxy-related headers
+      via off
+      forwarded_for delete
+      request_header_access Via deny all
+      request_header_access X-Forwarded-For deny all
+      request_header_access Proxy-Connection deny all
+      request_header_access Cache-Control deny all
+      reply_header_access Via deny all
+      reply_header_access X-Cache deny all
+      reply_header_access X-Cache-Lookup deny all
       SQUIDCONF
 
       systemctl enable squid
