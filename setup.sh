@@ -182,14 +182,26 @@ vpn_connect() {
 
     # Connect using the imported profile
     # FortiClient VPN-only uses --user and -p flag which prompts for password
-    # Use expect to automate the password prompt
-    limactl shell "$VM_NAME" -- expect -c "
-        set timeout 60
-        spawn /opt/forticlient/forticlient-cli vpn connect vpn-tunnel --user=$VPN_USERNAME -p
-        expect \"Please input password.\"
-        send \"$VPN_PASSWORD\r\"
-        expect eof
-    "
+    # Create expect script and run it
+    local expect_script="
+set timeout 60
+spawn /opt/forticlient/forticlient-cli vpn connect vpn-tunnel --user=${VPN_USERNAME} -p
+expect {
+    \"Please input password.\" {
+        send \"${VPN_PASSWORD}\r\"
+        exp_continue
+    }
+    \"STATUS::Established\" {
+        puts \"VPN connection established\"
+    }
+    timeout {
+        puts \"Connection timeout\"
+        exit 1
+    }
+    eof
+}
+"
+    echo "$expect_script" | limactl shell "$VM_NAME" -- expect -f -
 
     echo ""
     echo "VPN connected. Use proxy at http://127.0.0.1:3128 to access VPN resources."
