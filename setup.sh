@@ -267,6 +267,10 @@ expect {
             return 1
         fi
 
+        # Disconnect the stuck connection from first attempt before reconnecting
+        limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn disconnect 2>/dev/null || true
+        sleep 1
+
         # Reconnect and accept the certificate
         local reconnect_script="
 set timeout 60
