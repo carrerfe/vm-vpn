@@ -96,7 +96,28 @@ brew install lima
 - **CPUs**: 2
 - **Memory**: 4 GiB
 - **Disk**: 20 GiB
+- **FortiClient**: 7.4.x (installed from official Fortinet repo)
 - Pre-installed tools: `curl`, `wget`, `vim`, `htop`, `net-tools`, `iproute2`
+
+## FortiClient VPN Usage
+
+Once inside the VM, use the FortiClient CLI:
+
+```bash
+# Connect to VPN
+sudo /opt/forticlient/fortivpn connect <vpn-name> --server=<server> --user=<username>
+
+# Disconnect
+sudo /opt/forticlient/fortivpn disconnect
+
+# Check status
+sudo /opt/forticlient/fortivpn status
+```
+
+Or use the GUI (requires X11 forwarding or desktop environment):
+```bash
+/opt/forticlient/forticlient
+```
 
 ## Customization
 
