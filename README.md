@@ -1,17 +1,60 @@
 # VM VPN
 
-A Lima-based Ubuntu 24.04 LTS virtual machine for running FortiClient VPN with proxy servers accessible from the host machine.
+**Connect to Fortinet VPNs from modern Linux distributions** — even when the official FortiClient doesn't support your system.
 
-## Overview
+## Why This Project?
 
-This project provides:
-- **FortiClient VPN**: Runs inside a real VM for full isolation
-- **SOCKS5 Proxy**: SSH-based proxy for browsers and applications
-- **HTTP Proxy**: Squid proxy for HTTP/HTTPS traffic
-- **Firefox Integration**: Dedicated browser profile with auto-configured proxy
-- **Full VM**: Real Linux kernel, systemd, complete Ubuntu environment
+Fortinet's official Linux VPN client (FortiClient) often lags behind the latest Linux releases. If you're running **Ubuntu 24.10, 25.04, Fedora 40+**, or other recent distributions, you may find that:
 
-## Installation
+- FortiClient packages won't install due to dependency issues
+- The client crashes or fails to connect
+- Fortinet simply doesn't provide packages for your distro version
+
+**VM VPN solves this** by running FortiClient inside a lightweight Ubuntu 24.04 LTS virtual machine, then exposing the VPN connection to your host through proxy servers. Your browser and applications connect through the proxy — no need to install FortiClient directly on your system.
+
+## Quick Start (5 minutes)
+
+**Prerequisites:** You need [Lima](https://lima-vm.io/) (a lightweight VM manager) and `jq` installed.
+
+```bash
+# 1. Install dependencies (one-time setup)
+curl -fsSL https://lima-vm.io/install.sh | bash   # Install Lima
+sudo apt install jq                                # Install jq (Ubuntu/Debian)
+
+# 2. Install vm-vpn
+curl -fsSL https://raw.githubusercontent.com/carrerfe/vm-vpn/main/install.sh | bash
+
+# 3. Configure your VPN credentials
+cp ~/.local/bin/vpn-config.json.example ~/.local/bin/vpn-config.json
+nano ~/.local/bin/vpn-config.json   # Edit with your VPN server and username
+
+# 4. Connect!
+vmvpn vpn-connect
+
+# 5. Browse through the VPN
+vmvpn firefox
+```
+
+That's it! Firefox will open with a special profile that routes all traffic through the VPN.
+
+## How It Works
+
+1. **VM VPN** creates a small Ubuntu 24.04 VM with FortiClient pre-installed
+2. When you run `vmvpn vpn-connect`, it connects to your corporate VPN inside the VM
+3. A SOCKS5 proxy is started that tunnels traffic from your host through the VM
+4. `vmvpn firefox` launches a browser configured to use this proxy
+
+Your regular Firefox and other apps remain unaffected — only the dedicated VPN browser uses the tunnel.
+
+## Features
+
+- **Works on any Linux**: Ubuntu 24.10+, Fedora, Arch, etc.
+- **No system modifications**: VPN runs isolated in a VM
+- **Easy Firefox integration**: One command to browse through VPN
+- **SOCKS5 & HTTP proxies**: Use with any application
+- **Simple CLI**: `vpn-connect`, `vpn-disconnect`, `vpn-status`
+
+## Installation (Alternative)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/carrerfe/vm-vpn/main/install.sh | bash
