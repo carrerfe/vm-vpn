@@ -386,8 +386,8 @@ vpn_status() {
     read_proxy_config
     check_lima
     
-    echo "VPN status:"
-    limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn status 2>/dev/null || echo "VPN is not connected."
+    echo "VPN:"
+    limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn status 2>/dev/null | sed 's/^/  /' || echo "  Not connected"
     
     show_proxy_status
 }
