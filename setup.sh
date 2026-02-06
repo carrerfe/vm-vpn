@@ -158,50 +158,49 @@ vpn_connect() {
 
     echo "Connecting to VPN: $VPN_GATEWAY:$VPN_PORT as $VPN_USERNAME..."
 
-    # Generate XML config for FortiClient VPN-only
-    local xml_config="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<forticlient_configuration>
-  <vpn>
-    <sslvpn>
-      <options>
-        <enabled>1</enabled>
-      </options>
-      <connections>
-        <connection>
-          <name>vpn-tunnel</name>
-          <server>${VPN_GATEWAY}:${VPN_PORT}</server>
-          <username>${VPN_USERNAME}</username>
-        </connection>
-      </connections>
-    </sslvpn>
-  </vpn>
-</forticlient_configuration>"
-
-    # Import the config into FortiClient (run as non-root)
-    echo "$xml_config" | limactl shell "$VM_NAME" -- bash -c "cat > /tmp/vpn-config.xml && /opt/forticlient/forticlient-cli vpn import /tmp/vpn-config.xml 2>/dev/null || true"
-
-    # Connect using the imported profile
-    # FortiClient VPN-only uses --user and -p flag which prompts for password
-    # Create expect script and run it
-    local expect_script="
-set timeout 60
-spawn /opt/forticlient/forticlient-cli vpn connect vpn-tunnel --user=${VPN_USERNAME} -p
+    # Create/update VPN profile using expect (VPN-only version doesn't have import command)
+    local edit_script="
+set timeout 30
+spawn /opt/forticlient/forticlient-cli vpn edit vpn-tunnel
 expect {
-    \"Please input password.\" {
-        send \"${VPN_PASSWORD}\r\"
+    \"Remote Gateway:\" {
+        send \"${VPN_GATEWAY}:${VPN_PORT}\r\"
         exp_continue
     }
-    \"STATUS::Established\" {
-        puts \"VPN connection established\"
+    \"Authentication\" {
+        send \"1\r\"
+        exp_continue
     }
-    timeout {
-        puts \"Connection timeout\"
-        exit 1
+    \"Certificate Type\" {
+        send \"3\r\"
+        exp_continue
     }
     eof
 }
 "
-    echo "$expect_script" | limactl shell "$VM_NAME" -- expect -f -
+    echo "$edit_script" | limactl shell "$VM_NAME" -- expect -f - >/dev/null 2>&1
+
+    # Connect using the profile
+    local connect_script="
+set timeout 60
+spawn /opt/forticlient/forticlient-cli vpn connect vpn-tunnel --user=${VPN_USERNAME} -p
+expect {
+    \"Password:\" {
+        send \"${VPN_PASSWORD}\r\"
+        exp_continue
+    }
+    \"Please input password\" {
+        send \"${VPN_PASSWORD}\r\"
+        exp_continue
+    }
+    \"Confirm (y/n)\" {
+        send \"y\r\"
+        exp_continue
+    }
+    eof
+}
+"
+    echo "$connect_script" | limactl shell "$VM_NAME" -- expect -f -
 
     echo ""
     echo "VPN connected. Use proxy at http://127.0.0.1:3128 to access VPN resources."
