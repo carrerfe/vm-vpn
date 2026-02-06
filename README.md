@@ -119,6 +119,30 @@ Or use the GUI (requires X11 forwarding or desktop environment):
 /opt/forticlient/forticlient
 ```
 
+## Proxy Server
+
+The VM runs a Squid proxy on port **3128** that allows the host to access resources through the VPN tunnel.
+
+### Using the Proxy
+
+Once the VPN is connected inside the VM, configure your host applications to use the proxy:
+
+```bash
+# Test the proxy
+curl -x http://127.0.0.1:3128 http://internal-vpn-resource.example.com
+
+# Set environment variables for CLI tools
+export http_proxy=http://127.0.0.1:3128
+export https_proxy=http://127.0.0.1:3128
+
+# Or use per-command proxy
+curl --proxy http://127.0.0.1:3128 https://internal-site.example.com
+```
+
+### Browser Configuration
+
+Configure your browser to use proxy `127.0.0.1:3128` for HTTP/HTTPS traffic to access VPN resources.
+
 ## Customization
 
 Edit `ubuntu-vpn.yaml` to customize:
