@@ -158,12 +158,30 @@ vpn_connect() {
 
     echo "Connecting to VPN: $VPN_GATEWAY:$VPN_PORT as $VPN_USERNAME..."
 
-    # Use expect-like approach via stdin to avoid password prompts
-    # The password is passed via stdin to fortivpn
-    limactl shell "$VM_NAME" -- sudo /opt/forticlient/fortivpn connect vpn-tunnel \
-        --server="$VPN_GATEWAY:$VPN_PORT" \
-        --user="$VPN_USERNAME" \
-        --password-stdin <<< "$VPN_PASSWORD"
+    # Generate XML config for FortiClient
+    local xml_config="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<forticlient_configuration>
+  <vpn>
+    <sslvpn>
+      <options>
+        <enabled>1</enabled>
+      </options>
+      <connections>
+        <connection>
+          <name>vpn-tunnel</name>
+          <server>${VPN_GATEWAY}:${VPN_PORT}</server>
+          <username>${VPN_USERNAME}</username>
+        </connection>
+      </connections>
+    </sslvpn>
+  </vpn>
+</forticlient_configuration>"
+
+    # Import the config into FortiClient
+    echo "$xml_config" | limactl shell "$VM_NAME" -- bash -c "cat > /tmp/vpn-config.xml && sudo /opt/forticlient/forticlient-cli vpn import /tmp/vpn-config.xml 2>/dev/null || true"
+
+    # Connect using the imported profile, passing password via stdin
+    echo "$VPN_PASSWORD" | limactl shell "$VM_NAME" -- sudo /opt/forticlient/forticlient-cli vpn connect vpn-tunnel --username="$VPN_USERNAME"
 
     echo ""
     echo "VPN connected. Use proxy at http://127.0.0.1:3128 to access VPN resources."
@@ -172,14 +190,14 @@ vpn_connect() {
 vpn_disconnect() {
     check_lima
     echo "Disconnecting from VPN..."
-    limactl shell "$VM_NAME" -- sudo /opt/forticlient/fortivpn disconnect 2>/dev/null || true
+    limactl shell "$VM_NAME" -- sudo /opt/forticlient/forticlient-cli vpn disconnect 2>/dev/null || true
     echo "VPN disconnected."
 }
 
 vpn_status() {
     check_lima
     echo "VPN status:"
-    limactl shell "$VM_NAME" -- sudo /opt/forticlient/fortivpn status 2>/dev/null || echo "VPN is not connected."
+    limactl shell "$VM_NAME" -- sudo /opt/forticlient/forticlient-cli vpn status 2>/dev/null || echo "VPN is not connected."
 }
 
 case "${1:-}" in

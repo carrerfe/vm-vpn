@@ -150,7 +150,13 @@ If you prefer to connect manually inside the VM:
 ./setup.sh shell
 
 # Then inside the VM:
-sudo /opt/forticlient/fortivpn connect vpn-tunnel --server=vpn.example.com:443 --user=username
+sudo /opt/forticlient/forticlient-cli vpn connect <profile-name> --username=<username>
+
+# List VPN profiles
+sudo /opt/forticlient/forticlient-cli vpn list
+
+# Check status
+sudo /opt/forticlient/forticlient-cli vpn status
 ```
 
 ## Proxy Server
