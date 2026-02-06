@@ -6,24 +6,27 @@ VM_NAME="ubuntu-vpn"
 VM_CONFIG="$SCRIPT_DIR/ubuntu-vpn.yaml"
 VPN_CONFIG="${VPN_CONFIG:-$SCRIPT_DIR/vpn-config.json}"
 CERT_FINGERPRINT_FILE="$SCRIPT_DIR/.vpn-cert-fingerprint"
+FIREFOX_PROFILE_NAME="ubuntu-vpn"
 
 usage() {
-    echo "Usage: $0 {start|stop|restart|shell|ssh|status|delete|vpn-connect|vpn-disconnect|vpn-status}"
+    echo "Usage: $0 {start|stop|restart|shell|ssh|status|delete|vpn-connect|vpn-disconnect|vpn-status|firefox|firefox-profile}"
     echo ""
     echo "Commands:"
-    echo "  start          Create and start the VM"
-    echo "  stop           Stop the VM"
-    echo "  restart        Restart the VM"
-    echo "  shell          Open a shell in the VM"
-    echo "  ssh            Connect via SSH"
-    echo "  status         Show VM status"
-    echo "  delete         Delete the VM completely"
-    echo "  vpn-connect    Connect to VPN (auto-starts VM and proxies per config)"
-    echo "  vpn-disconnect Disconnect from VPN (stops proxies)"
-    echo "  vpn-status     Show VPN and proxy status"
+    echo "  start           Create and start the VM"
+    echo "  stop            Stop the VM"
+    echo "  restart         Restart the VM"
+    echo "  shell           Open a shell in the VM"
+    echo "  ssh             Connect via SSH"
+    echo "  status          Show VM status"
+    echo "  delete          Delete the VM completely"
+    echo "  vpn-connect     Connect to VPN (auto-starts VM and proxies per config)"
+    echo "  vpn-disconnect  Disconnect from VPN (stops proxies)"
+    echo "  vpn-status      Show VPN and proxy status"
+    echo "  firefox         Launch Firefox with VPN proxy profile"
+    echo "  firefox-profile Show Firefox profile info and deletion command"
     echo ""
     echo "Environment variables:"
-    echo "  VPN_CONFIG     Path to VPN config JSON file (default: ./vpn-config.json)"
+    echo "  VPN_CONFIG      Path to VPN config JSON file (default: ./vpn-config.json)"
     exit 1
 }
 
@@ -413,6 +416,165 @@ show_proxy_status() {
     fi
 }
 
+get_firefox_profile_path() {
+    local profiles_dir="$HOME/.mozilla/firefox"
+    if [[ ! -d "$profiles_dir" ]]; then
+        return 0
+    fi
+    
+    # Find profile by profiles.ini
+    local profile_ini="$profiles_dir/profiles.ini"
+    if [[ -f "$profile_ini" ]]; then
+        local rel_path
+        rel_path=$(awk -v name="$FIREFOX_PROFILE_NAME" '
+            /^\[Profile/ { in_profile=1; path=""; found_name=0 }
+            in_profile && /^Name=/ { sub(/^Name=/, ""); if ($0 == name) found_name=1 }
+            in_profile && /^Path=/ { sub(/^Path=/, ""); path=$0 }
+            in_profile && /^\[/ { if (found_name && path != "") { print path; exit } }
+            END { if (found_name && path != "") print path }
+        ' "$profile_ini")
+        if [[ -n "$rel_path" ]]; then
+            echo "$profiles_dir/$rel_path"
+            return 0
+        fi
+    fi
+    
+    # Fallback: look for directory ending with profile name
+    local dir
+    for dir in "$profiles_dir"/*."$FIREFOX_PROFILE_NAME"; do
+        if [[ -d "$dir" ]]; then
+            echo "$dir"
+            return 0
+        fi
+    done
+}
+
+create_firefox_profile() {
+    read_proxy_config
+    
+    # Check if Firefox is installed
+    if ! command -v firefox &> /dev/null; then
+        echo "Error: Firefox is not installed."
+        exit 1
+    fi
+    
+    # Create profile if it doesn't exist
+    if ! firefox -P "$FIREFOX_PROFILE_NAME" -no-remote -headless -CreateProfile "$FIREFOX_PROFILE_NAME" 2>/dev/null; then
+        # Profile might already exist, that's fine
+        true
+    fi
+    
+    # Find the profile path
+    local profile_path
+    profile_path=$(get_firefox_profile_path)
+    
+    if [[ -z "$profile_path" || ! -d "$profile_path" ]]; then
+        # Create profile explicitly
+        firefox -CreateProfile "$FIREFOX_PROFILE_NAME" 2>/dev/null || true
+        sleep 1
+        profile_path=$(get_firefox_profile_path)
+    fi
+    
+    if [[ -z "$profile_path" || ! -d "$profile_path" ]]; then
+        echo "Error: Could not find or create Firefox profile directory"
+        exit 1
+    fi
+    
+    # Configure proxy settings in user.js
+    local user_js="$profile_path/user.js"
+    
+    # Determine which proxy to use (prefer SOCKS if enabled)
+    local proxy_type proxy_host proxy_port
+    if [[ "$SOCKS_PROXY_ENABLED" == "true" ]]; then
+        proxy_type=1  # Manual proxy
+        proxy_host="127.0.0.1"
+        proxy_port="$SOCKS_PROXY_PORT"
+        cat > "$user_js" << EOF
+// Ubuntu VPN Proxy Configuration (auto-generated)
+user_pref("network.proxy.type", 1);
+user_pref("network.proxy.socks", "$proxy_host");
+user_pref("network.proxy.socks_port", $proxy_port);
+user_pref("network.proxy.socks_version", 5);
+user_pref("network.proxy.socks_remote_dns", true);
+user_pref("network.proxy.no_proxies_on", "");
+EOF
+    elif [[ "$HTTP_PROXY_ENABLED" == "true" ]]; then
+        proxy_host="127.0.0.1"
+        proxy_port="$HTTP_PROXY_PORT"
+        cat > "$user_js" << EOF
+// Ubuntu VPN Proxy Configuration (auto-generated)
+user_pref("network.proxy.type", 1);
+user_pref("network.proxy.http", "$proxy_host");
+user_pref("network.proxy.http_port", $proxy_port);
+user_pref("network.proxy.ssl", "$proxy_host");
+user_pref("network.proxy.ssl_port", $proxy_port);
+user_pref("network.proxy.no_proxies_on", "");
+EOF
+    else
+        echo "Warning: No proxy enabled in config. Firefox will use direct connection."
+        cat > "$user_js" << EOF
+// Ubuntu VPN Proxy Configuration (auto-generated)
+user_pref("network.proxy.type", 0);
+EOF
+    fi
+    
+    echo "$profile_path"
+}
+
+launch_firefox() {
+    local profile_path
+    profile_path=$(create_firefox_profile)
+    
+    echo "Launching Firefox with profile '$FIREFOX_PROFILE_NAME'..."
+    if [[ "$SOCKS_PROXY_ENABLED" == "true" ]]; then
+        echo "  Using SOCKS5 proxy: localhost:$SOCKS_PROXY_PORT"
+    elif [[ "$HTTP_PROXY_ENABLED" == "true" ]]; then
+        echo "  Using HTTP proxy: localhost:$HTTP_PROXY_PORT"
+    fi
+    
+    # Launch Firefox with the profile (in background, detached)
+    nohup firefox -P "$FIREFOX_PROFILE_NAME" -no-remote "$@" >/dev/null 2>&1 &
+    disown
+    
+    echo "Firefox launched."
+}
+
+show_firefox_profile() {
+    read_proxy_config
+    
+    local profile_path
+    profile_path=$(get_firefox_profile_path)
+    
+    echo "Firefox VPN Profile"
+    echo "==================="
+    echo ""
+    echo "Profile name: $FIREFOX_PROFILE_NAME"
+    
+    if [[ -n "$profile_path" && -d "$profile_path" ]]; then
+        echo "Profile path: $profile_path"
+        echo ""
+        echo "Proxy configuration:"
+        if [[ -f "$profile_path/user.js" ]]; then
+            grep -E "network.proxy" "$profile_path/user.js" | sed 's/^/  /'
+        else
+            echo "  (no user.js found)"
+        fi
+    else
+        echo "Profile path: (not created yet - run 'firefox' command first)"
+    fi
+    
+    echo ""
+    echo "To delete this profile, run:"
+    echo "  firefox -P  # Opens profile manager, select '$FIREFOX_PROFILE_NAME' and click 'Delete Profile'"
+    echo ""
+    echo "Or manually delete:"
+    if [[ -n "$profile_path" && -d "$profile_path" ]]; then
+        echo "  rm -rf \"$profile_path\""
+    else
+        echo "  rm -rf ~/.mozilla/firefox/*.$FIREFOX_PROFILE_NAME"
+    fi
+}
+
 case "${1:-}" in
     start)
         start
@@ -443,6 +605,12 @@ case "${1:-}" in
         ;;
     vpn-status)
         vpn_status
+        ;;
+    firefox)
+        launch_firefox "${@:2}"
+        ;;
+    firefox-profile)
+        show_firefox_profile
         ;;
     *)
         usage
