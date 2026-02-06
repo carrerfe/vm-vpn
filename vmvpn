@@ -330,10 +330,30 @@ expect {
     eof
 }
 "
-        echo "$reconnect_script" | limactl shell "$VM_NAME" -- expect -f -
+        connect_output=$(echo "$reconnect_script" | limactl shell "$VM_NAME" -- expect -f - 2>&1)
+        echo "$connect_output"
     else
         # No certificate prompt - just show the output
         echo "$connect_output"
+    fi
+
+    # Check if login failed
+    if echo "$connect_output" | grep -q "Login failed"; then
+        echo ""
+        echo "ERROR: VPN login failed. Please check your credentials."
+        return 1
+    fi
+
+    # Verify VPN is actually connected
+    sleep 2
+    local vpn_status
+    vpn_status=$(limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn status 2>&1 || true)
+    
+    if ! echo "$vpn_status" | grep -q "Status: Connected"; then
+        echo ""
+        echo "ERROR: VPN connection failed."
+        echo "$vpn_status"
+        return 1
     fi
 
     # Start proxies if configured
