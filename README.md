@@ -1,29 +1,33 @@
-# Ubuntu VPN Lima VM
+# uvpn - Ubuntu VPN CLI
 
-A Lima-based Ubuntu 24.04 LTS virtual machine for running FortiClient VPN with a proxy server accessible from the host machine.
+A Lima-based Ubuntu 24.04 LTS virtual machine for running FortiClient VPN with proxy servers accessible from the host machine.
 
 ## Overview
 
 This project provides:
 - **FortiClient VPN**: Runs inside a real VM for full isolation
-- **Proxy Server**: Running in the VM, allows the host to access web resources through the VPN tunnel
+- **SOCKS5 Proxy**: SSH-based proxy for browsers and applications
+- **HTTP Proxy**: Squid proxy for HTTP/HTTPS traffic
+- **Firefox Integration**: Dedicated browser profile with auto-configured proxy
 - **Full VM**: Real Linux kernel, systemd, complete Ubuntu environment
 
 ## Requirements
 
 - [Lima](https://lima-vm.io/) - Linux virtual machines on Linux/macOS
 - QEMU (installed automatically by Lima on most systems)
+- jq (for JSON config parsing)
 
-### Install Lima
+### Install Dependencies
 
 **Linux:**
 ```bash
 curl -fsSL https://lima-vm.io/install.sh | bash
+sudo apt install jq  # Debian/Ubuntu
 ```
 
 **macOS:**
 ```bash
-brew install lima
+brew install lima jq
 ```
 
 ## Architecture
@@ -50,46 +54,71 @@ brew install lima
 ## Quick Start
 
 ```bash
-# Create and start the VM
-./setup.sh start
+# 1. Create your VPN config
+cp vpn-config.json.example vpn-config.json
+# Edit vpn-config.json with your credentials
 
-# Access the VM shell
-./setup.sh shell
+# 2. Connect to VPN (auto-starts VM and proxies)
+./uvpn vpn-connect
 
-# Or connect via SSH
-./setup.sh ssh
+# 3. Launch Firefox with VPN proxy
+./uvpn firefox
 
-# Check VM status
-./setup.sh status
+# 4. Check status
+./uvpn vpn-status
 
-# Stop the VM
-./setup.sh stop
-
-# Delete the VM completely
-./setup.sh delete
+# 5. Disconnect when done
+./uvpn vpn-disconnect
 ```
 
-## Setup Script Commands
+## Shell Completion
 
+```bash
+# Bash - add to ~/.bashrc
+eval "$(./uvpn completion bash)"
+
+# Zsh - add to ~/.zshrc
+eval "$(./uvpn completion zsh)"
+```
+
+## Commands
+
+### VM Commands
+| Command    | Description                    |
+|------------|--------------------------------|
+| `start`    | Create and start the VM        |
+| `stop`     | Stop the VM                    |
+| `restart`  | Restart the VM                 |
+| `shell`    | Open a shell in the VM         |
+| `ssh`      | Connect via SSH                |
+| `status`   | Show VM status                 |
+| `delete`   | Delete the VM and all its data |
+
+### VPN Commands
 | Command          | Description                              |
 |------------------|------------------------------------------|
-| `start`          | Create and start the VM                  |
-| `stop`           | Stop the VM                              |
-| `restart`        | Restart the VM                           |
-| `shell`          | Open a shell in the VM                   |
-| `ssh`            | Connect via SSH                          |
-| `status`         | Show VM status                           |
-| `delete`         | Delete the VM and all its data           |
-| `vpn-connect`    | Connect to VPN using vpn-config.json     |
-| `vpn-disconnect` | Disconnect from VPN                      |
-| `vpn-status`     | Show VPN connection status               |
+| `vpn-connect`    | Connect to VPN (auto-starts VM/proxies)  |
+| `vpn-disconnect` | Disconnect from VPN (stops proxies)      |
+| `vpn-status`     | Show VPN and proxy status                |
+
+### Browser Commands
+| Command          | Description                              |
+|------------------|------------------------------------------|
+| `firefox`        | Launch Firefox with VPN proxy profile    |
+| `firefox-profile`| Show Firefox profile info and deletion   |
+
+### Shell Completion
+| Command           | Description                    |
+|-------------------|--------------------------------|
+| `completion bash` | Output bash completion script  |
+| `completion zsh`  | Output zsh completion script   |
 
 ## Project Structure
 
 ```
 .
+├── uvpn                    # CLI script
 ├── ubuntu-vpn.yaml         # Lima VM configuration
-├── setup.sh                # Management script
 ├── vpn-config.json.example # VPN config template
 ├── vpn-config.json         # Your VPN credentials (gitignored)
 └── README.md
@@ -106,39 +135,34 @@ brew install lima
 
 ## FortiClient VPN Usage
 
-### Quick Connect (Recommended)
-
-1. Create your VPN config file:
-```bash
-cp vpn-config.json.example vpn-config.json
-# Edit vpn-config.json with your credentials
-```
-
-2. Connect/disconnect using the setup script:
-```bash
-# Connect to VPN
-./setup.sh vpn-connect
-
-# Check VPN status
-./setup.sh vpn-status
-
-# Disconnect from VPN
-./setup.sh vpn-disconnect
-```
-
 ### VPN Config File
 
-Create `vpn-config.json` with your VPN settings:
+Create `vpn-config.json` with your VPN and proxy settings:
 
 ```json
 {
   "gateway": "vpn.example.com",
   "port": 443,
-  "username": "your-username"
+  "username": "your-username",
+  "socks_proxy": {
+    "enabled": true,
+    "port": 1080,
+    "auto_start": true,
+    "auto_stop": true
+  },
+  "http_proxy": {
+    "enabled": false,
+    "port": 3128,
+    "auto_start": false,
+    "auto_stop": false
+  }
 }
 ```
 
-The `password` field is optional. If omitted, you'll be prompted to enter it interactively (hidden input).
+- **password**: Optional. If omitted, you'll be prompted interactively.
+- **socks_proxy**: SOCKS5 proxy via SSH (recommended for browsers)
+- **http_proxy**: Squid HTTP proxy
+- **auto_start/auto_stop**: Control proxy lifecycle with VPN connect/disconnect
 
 > **Note:** `vpn-config.json` is gitignored to protect your credentials.
 
@@ -147,7 +171,7 @@ The `password` field is optional. If omitted, you'll be prompted to enter it int
 If you prefer to connect manually inside the VM:
 
 ```bash
-./setup.sh shell
+./uvpn shell
 
 # Then inside the VM (run as non-root user):
 /opt/forticlient/forticlient-cli vpn connect <profile-name> --username=<username>
@@ -159,29 +183,45 @@ If you prefer to connect manually inside the VM:
 /opt/forticlient/forticlient-cli vpn status
 ```
 
-## Proxy Server
+## Proxy Servers
 
-The VM runs a Squid proxy on port **3128** that allows the host to access resources through the VPN tunnel.
+Two proxy options are available:
 
-### Using the Proxy
+### SOCKS5 Proxy (Recommended)
 
-Once the VPN is connected inside the VM, configure your host applications to use the proxy:
+SSH-based SOCKS5 proxy on port **1080** (default). Best for browsers.
 
 ```bash
-# Test the proxy
-curl -x http://127.0.0.1:3128 http://internal-vpn-resource.example.com
-
-# Set environment variables for CLI tools
-export http_proxy=http://127.0.0.1:3128
-export https_proxy=http://127.0.0.1:3128
-
-# Or use per-command proxy
-curl --proxy http://127.0.0.1:3128 https://internal-site.example.com
+# Test with curl
+curl --socks5-hostname 127.0.0.1:1080 https://internal-site.example.com
 ```
 
-### Browser Configuration
+### HTTP Proxy
 
-Configure your browser to use proxy `127.0.0.1:3128` for HTTP/HTTPS traffic to access VPN resources.
+Squid HTTP proxy on port **3128**. Enable in config if needed.
+
+```bash
+# Test with curl
+curl -x http://127.0.0.1:3128 https://internal-site.example.com
+
+# Set environment variables
+export http_proxy=http://127.0.0.1:3128
+export https_proxy=http://127.0.0.1:3128
+```
+
+### Firefox Integration
+
+The easiest way to browse through the VPN:
+
+```bash
+# Launch Firefox with pre-configured proxy profile
+./uvpn firefox
+
+# View profile info and deletion instructions
+./uvpn firefox-profile
+```
+
+This creates a dedicated `ubuntu-vpn` Firefox profile with proxy settings matching your config.
 
 ## Customization
 

@@ -8,10 +8,14 @@ VPN_CONFIG="${VPN_CONFIG:-$SCRIPT_DIR/vpn-config.json}"
 CERT_FINGERPRINT_FILE="$SCRIPT_DIR/.vpn-cert-fingerprint"
 FIREFOX_PROFILE_NAME="ubuntu-vpn"
 
+COMMANDS="start stop restart shell ssh status delete vpn-connect vpn-disconnect vpn-status firefox firefox-profile completion"
+
 usage() {
-    echo "Usage: $0 {start|stop|restart|shell|ssh|status|delete|vpn-connect|vpn-disconnect|vpn-status|firefox|firefox-profile}"
+    echo "uvpn - Ubuntu VPN CLI"
     echo ""
-    echo "Commands:"
+    echo "Usage: uvpn <command> [options]"
+    echo ""
+    echo "VM Commands:"
     echo "  start           Create and start the VM"
     echo "  stop            Stop the VM"
     echo "  restart         Restart the VM"
@@ -19,11 +23,19 @@ usage() {
     echo "  ssh             Connect via SSH"
     echo "  status          Show VM status"
     echo "  delete          Delete the VM completely"
+    echo ""
+    echo "VPN Commands:"
     echo "  vpn-connect     Connect to VPN (auto-starts VM and proxies per config)"
     echo "  vpn-disconnect  Disconnect from VPN (stops proxies)"
     echo "  vpn-status      Show VPN and proxy status"
+    echo ""
+    echo "Browser Commands:"
     echo "  firefox         Launch Firefox with VPN proxy profile"
     echo "  firefox-profile Show Firefox profile info and deletion command"
+    echo ""
+    echo "Shell Completion:"
+    echo "  completion bash   Output bash completion script"
+    echo "  completion zsh    Output zsh completion script"
     echo ""
     echo "Environment variables:"
     echo "  VPN_CONFIG      Path to VPN config JSON file (default: ./vpn-config.json)"
@@ -575,6 +587,93 @@ show_firefox_profile() {
     fi
 }
 
+generate_completion() {
+    local shell_type="$1"
+    
+    case "$shell_type" in
+        bash)
+            cat << 'EOF'
+# uvpn bash completion
+# Add to ~/.bashrc: eval "$(uvpn completion bash)"
+# Or save to: /etc/bash_completion.d/uvpn
+
+_uvpn_completions() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local prev="${COMP_WORDS[COMP_CWORD-1]}"
+    
+    case "$prev" in
+        uvpn)
+            COMPREPLY=($(compgen -W "start stop restart shell ssh status delete vpn-connect vpn-disconnect vpn-status firefox firefox-profile completion" -- "$cur"))
+            ;;
+        completion)
+            COMPREPLY=($(compgen -W "bash zsh" -- "$cur"))
+            ;;
+        *)
+            COMPREPLY=()
+            ;;
+    esac
+}
+
+complete -F _uvpn_completions uvpn
+EOF
+            ;;
+        zsh)
+            cat << 'EOF'
+#compdef uvpn
+# uvpn zsh completion
+# Add to ~/.zshrc: eval "$(uvpn completion zsh)"
+# Or save to a file in your $fpath
+
+_uvpn() {
+    local -a commands
+    commands=(
+        'start:Create and start the VM'
+        'stop:Stop the VM'
+        'restart:Restart the VM'
+        'shell:Open a shell in the VM'
+        'ssh:Connect via SSH'
+        'status:Show VM status'
+        'delete:Delete the VM completely'
+        'vpn-connect:Connect to VPN (auto-starts VM and proxies)'
+        'vpn-disconnect:Disconnect from VPN (stops proxies)'
+        'vpn-status:Show VPN and proxy status'
+        'firefox:Launch Firefox with VPN proxy profile'
+        'firefox-profile:Show Firefox profile info'
+        'completion:Generate shell completion script'
+    )
+    
+    local -a completion_shells
+    completion_shells=(
+        'bash:Generate bash completion'
+        'zsh:Generate zsh completion'
+    )
+    
+    case "$words[2]" in
+        completion)
+            _describe 'shell' completion_shells
+            ;;
+        *)
+            _describe 'command' commands
+            ;;
+    esac
+}
+
+_uvpn "$@"
+EOF
+            ;;
+        *)
+            echo "Usage: uvpn completion {bash|zsh}"
+            echo ""
+            echo "Generate shell completion script."
+            echo ""
+            echo "Examples:"
+            echo "  eval \"\$(uvpn completion bash)\"  # Add to ~/.bashrc"
+            echo "  eval \"\$(uvpn completion zsh)\"   # Add to ~/.zshrc"
+            exit 1
+            ;;
+    esac
+}
+
 case "${1:-}" in
     start)
         start
@@ -611,6 +710,9 @@ case "${1:-}" in
         ;;
     firefox-profile)
         show_firefox_profile
+        ;;
+    completion)
+        generate_completion "${2:-}"
         ;;
     *)
         usage
