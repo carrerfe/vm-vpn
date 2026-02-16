@@ -14,12 +14,14 @@ Fortinet's official Linux VPN client (FortiClient) often lags behind the latest 
 
 ## Quick Start (5 minutes)
 
-**Prerequisites:** You need [Lima](https://lima-vm.io/) (a lightweight VM manager) and `jq` installed.
+**Prerequisites:** You need [QEMU](https://www.qemu.org/), [Lima](https://lima-vm.io/) (a lightweight VM manager), and `jq` installed.
 
 ```bash
 # 1. Install dependencies (one-time setup)
-curl -fsSL https://lima-vm.io/install.sh | bash   # Install Lima
-sudo apt install jq                                # Install jq (Ubuntu/Debian)
+sudo apt install qemu-system jq                    # Install QEMU and jq (Ubuntu/Debian)
+
+VERSION=$(curl -fsSL https://api.github.com/repos/lima-vm/lima/releases/latest | jq -r .tag_name)
+curl -fsSL "https://github.com/lima-vm/lima/releases/download/${VERSION}/lima-${VERSION:1}-$(uname -s)-$(uname -m).tar.gz" | sudo tar Cxzvm /usr/local
 
 # 2. Install vm-vpn
 curl -fsSL https://raw.githubusercontent.com/carrerfe/vm-vpn/main/install.sh | bash
@@ -64,21 +66,36 @@ This installs to `~/.local/bin`. Set `VMVPN_INSTALL_DIR` to customize.
 
 ## Requirements
 
-- [Lima](https://lima-vm.io/) - Linux virtual machines on Linux/macOS
-- QEMU (installed automatically by Lima on most systems)
+- [QEMU](https://www.qemu.org/) - required VM backend for Lima
+- [Lima](https://lima-vm.io/) - lightweight Linux virtual machines on Linux/macOS
 - jq (for JSON config parsing)
 
 ### Install Dependencies
 
-**Linux:**
+**Linux (Ubuntu/Debian):**
 ```bash
-curl -fsSL https://lima-vm.io/install.sh | bash
-sudo apt install jq  # Debian/Ubuntu
+# 1. Install QEMU and jq
+sudo apt install qemu-system jq
+
+# 2. Install Lima (binary from GitHub releases)
+VERSION=$(curl -fsSL https://api.github.com/repos/lima-vm/lima/releases/latest | jq -r .tag_name)
+curl -fsSL "https://github.com/lima-vm/lima/releases/download/${VERSION}/lima-${VERSION:1}-$(uname -s)-$(uname -m).tar.gz" | sudo tar Cxzvm /usr/local
+```
+
+**Linux (Fedora/RHEL):**
+```bash
+# 1. Install QEMU and jq
+sudo dnf install qemu-system-x86 jq
+
+# 2. Install Lima (binary from GitHub releases)
+VERSION=$(curl -fsSL https://api.github.com/repos/lima-vm/lima/releases/latest | jq -r .tag_name)
+curl -fsSL "https://github.com/lima-vm/lima/releases/download/${VERSION}/lima-${VERSION:1}-$(uname -s)-$(uname -m).tar.gz" | sudo tar Cxzvm /usr/local
 ```
 
 **macOS:**
 ```bash
 brew install lima jq
+# QEMU is installed automatically by Homebrew as a Lima dependency
 ```
 
 ## Architecture
