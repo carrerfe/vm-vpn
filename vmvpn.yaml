@@ -34,7 +34,10 @@ provision:
         vim \
         less \
         htop \
-        expect
+        expect \
+        gnome-keyring \
+        dbus-x11 \
+        libsecret-1-0
 
       # Install FortiClient VPN-only (free standalone version from official Fortinet download)
       # https://www.fortinet.com/support/product-downloads -> FortiClient VPN-only -> Linux .deb

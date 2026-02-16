@@ -246,6 +246,14 @@ vpn_connect() {
 
     echo "Connecting to VPN: $VPN_GATEWAY:$VPN_PORT as $VPN_USERNAME..."
 
+    # Ensure gnome-keyring-daemon is running (provides org.freedesktop.secrets for FortiClient)
+    limactl shell "$VM_NAME" -- bash -c '
+        if ! pgrep -u $USER gnome-keyring-d > /dev/null 2>&1; then
+            eval $(dbus-launch --sh-syntax 2>/dev/null) || true
+            echo "" | gnome-keyring-daemon --unlock --components=secrets 2>/dev/null || true
+        fi
+    ' 2>/dev/null || true
+
     # Create/update VPN profile using expect (VPN-only version doesn't have import command)
     local edit_script="
 set timeout 30
