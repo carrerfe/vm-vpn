@@ -308,7 +308,19 @@ expect {
 
         # Disconnect the stuck connection from first attempt before reconnecting
         limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn disconnect 2>/dev/null || true
-        sleep 1
+
+        # Wait until the tunnel is actually down (up to 15 seconds)
+        local max_wait=15
+        local waited=0
+        while (( waited < max_wait )); do
+            local status_check
+            status_check=$(limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn status 2>&1 || true)
+            if ! echo "$status_check" | grep -qi "Status: Connected\|tunnel.*active"; then
+                break
+            fi
+            sleep 1
+            (( waited++ ))
+        done
 
         # Reconnect and accept the certificate
         local reconnect_script="
