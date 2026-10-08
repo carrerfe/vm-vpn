@@ -18,6 +18,8 @@ gi.require_version("GLib", "2.0")
 gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib
 
+VERSION = "1.0.0"
+
 # Exit codes of the vmvpn CLI (see `vmvpn` usage / README).
 EXIT_OK = 0
 EXIT_ERROR = 1

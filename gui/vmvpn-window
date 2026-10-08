@@ -302,8 +302,8 @@ class StatusPage(Gtk.Box):
             str(vm.get("status") or ("Not created" if not vm.get("exists") else "—"))
         )
         self.row_vm_cpus.set_subtitle(str(vm.get("cpus") or "—"))
-        self.row_vm_mem.set_subtitle(_fmt_size(vm.get("memory")))
-        self.row_vm_disk.set_subtitle(_fmt_size(vm.get("disk")))
+        self.row_vm_mem.set_subtitle(_fmt_size(vm.get("memory_bytes")))
+        self.row_vm_disk.set_subtitle(_fmt_size(vm.get("disk_bytes")))
 
         if guest:
             self._levelbar_row(
@@ -1354,11 +1354,20 @@ class VmVpnApp(Adw.Application):
         win.present()
 
     def _on_about(self, *_args):
+        win = self.props.active_window
+        cli_version = "unknown"
+        if win is not None:
+            cli_version = (win.status or {}).get("version") or "unknown"
+        debug_info = "CLI: %s\nCLI path: %s" % (
+            cli_version,
+            vc.find_cli() or "not found",
+        )
         about = Adw.AboutWindow(
-            transient_for=self.props.active_window,
+            transient_for=win,
             application_name="VM VPN",
             application_icon="network-vpn",
-            version="1.0",
+            version=vc.VERSION,
+            debug_info=debug_info,
             comments=(
                 "Control window for the Lima-based FortiClient VPN "
                 "virtual machine."
@@ -1368,6 +1377,9 @@ class VmVpnApp(Adw.Application):
 
 
 def main():
+    if any(a in ("--version", "-V") for a in sys.argv[1:]):
+        print("vmvpn-window %s" % vc.VERSION)
+        return 0
     app = VmVpnApp()
     return app.run([sys.argv[0]])
 

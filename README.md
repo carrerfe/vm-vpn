@@ -202,11 +202,12 @@ eval "$(./vmvpn completion zsh)"
 | `firefox`        | Launch Firefox with VPN proxy profile    |
 | `firefox-profile`| Show Firefox profile info and deletion   |
 
-### Shell Completion
-| Command           | Description                    |
-|-------------------|--------------------------------|
-| `completion bash` | Output bash completion script  |
-| `completion zsh`  | Output zsh completion script   |
+### Other Commands
+| Command            | Description                    |
+|--------------------|--------------------------------|
+| `version`          | Print version (`--version`/`-V`) |
+| `completion bash`  | Output bash completion script  |
+| `completion zsh`   | Output zsh completion script   |
 
 ## Project Structure
 
@@ -346,6 +347,20 @@ Both processes poll `vmvpn status --json`, respect the CLI operation lock
 > appindicator extension declined the GMenu-based protocol —
 > ubuntu/gnome-shell-extension-appindicator#597). The tray therefore uses
 > GTK3 + AyatanaAppIndicator3 in a separate process.
+
+### Screenshots
+
+![Status page — VPN connected](docs/screenshots/window-status.png)
+*Status page while connected — VPN state, proxy endpoints, VM details.*
+
+![Logs page](docs/screenshots/window-logs.png)
+*Logs page tailing the guest FortiClient log.*
+
+![Settings page](docs/screenshots/window-settings.png)
+*Settings page — connection and keyring password storage.*
+
+![Certificate trust dialog](docs/screenshots/dialog-certificate.png)
+*First-connection certificate trust dialog.*
 
 ### GUI dependencies
 

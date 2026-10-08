@@ -245,7 +245,15 @@ class TrayApp:
             not busy,
             window_visible,
             vc.autostart_enabled(), not busy,
+            self._version_label(),
         )
+
+    def _version_label(self):
+        label = "VM VPN %s" % vc.VERSION
+        cli_version = (self.status or {}).get("version")
+        if cli_version and cli_version != vc.VERSION:
+            label += " (CLI %s)" % cli_version
+        return label
 
     def _rebuild_menu(self):
         sig = self._menu_signature()
@@ -346,6 +354,11 @@ class TrayApp:
         autostart_item.connect("toggled", self._on_autostart_toggled)
         autostart_item.show()
         menu.append(autostart_item)
+
+        version_item = Gtk.MenuItem(label=self._version_label())
+        version_item.set_sensitive(False)
+        version_item.show()
+        menu.append(version_item)
 
         quit_item = Gtk.MenuItem(label="Quit")
         quit_item.connect("activate", self._on_quit_item)
@@ -621,6 +634,9 @@ class TrayApp:
 
 
 def main():
+    if any(a in ("--version", "-V") for a in sys.argv[1:]):
+        print("vmvpn-tray %s" % vc.VERSION)
+        return 0
     app = TrayApp()
     return app.app.run([sys.argv[0]])
 

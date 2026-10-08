@@ -179,4 +179,5 @@ else
     echo "  vmvpn delete && vmvpn vpn-connect"
 fi
 echo ""
+"$INSTALL_DIR/vmvpn" --version
 echo "Done!"

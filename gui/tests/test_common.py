@@ -4,6 +4,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -465,6 +466,28 @@ class TestConfigHelpers(FlowTestCase):
         del cfg["password"]
         vc.save_config(path, cfg)
         self.assertNotIn("password", vc.load_config(path))
+
+
+class TestVersion(FlowTestCase):
+    def _cli_path(self):
+        return os.path.realpath(
+            os.path.join(os.path.dirname(vc.__file__), "..", "vmvpn")
+        )
+
+    def test_gui_version_matches_cli(self):
+        with open(self._cli_path(), encoding="utf-8") as f:
+            match = re.search(r'^VMVPN_VERSION="([^"]+)"', f.read(),
+                              re.MULTILINE)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(1), vc.VERSION)
+
+    def test_cli_version_flag(self):
+        out = subprocess.run(
+            [self._cli_path(), "--version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(out.returncode, 0)
+        self.assertEqual(out.stdout.strip(), "vmvpn %s" % vc.VERSION)
 
 
 if __name__ == "__main__":

@@ -8,8 +8,9 @@ VPN_CONFIG="${VPN_CONFIG:-$SCRIPT_DIR/vpn-config.json}"
 CERT_FINGERPRINT_FILE="$SCRIPT_DIR/.vpn-cert-fingerprint"
 FIREFOX_PROFILE_NAME="vmvpn"
 START_TIMEOUT="30m"
+VMVPN_VERSION="1.0.0"
 
-COMMANDS="start stop restart shell ssh status delete logs vpn-connect vpn-disconnect vpn-status password-set password-clear cert-forget firefox firefox-profile completion"
+COMMANDS="start stop restart shell ssh status delete logs vpn-connect vpn-disconnect vpn-status password-set password-clear cert-forget firefox firefox-profile completion version"
 
 usage() {
     echo "vmvpn - VM VPN CLI"
@@ -43,6 +44,9 @@ usage() {
     echo "Shell Completion:"
     echo "  completion bash   Output bash completion script"
     echo "  completion zsh    Output zsh completion script"
+    echo ""
+    echo "Other:"
+    echo "  version           Print version (also --version, -V)"
     echo ""
     echo "Environment variables:"
     echo "  VPN_CONFIG        Path to VPN config JSON file (default: ./vpn-config.json)"
@@ -303,6 +307,7 @@ status_json() {
     fi
 
     jq -n \
+        --arg ver "$VMVPN_VERSION" \
         --argjson busy "$busy" \
         --argjson vm "$vm_obj" \
         --argjson guest "$guest_json" \
@@ -325,6 +330,7 @@ status_json() {
         --arg certFp "$cert_fp" \
         '{
             schema: 1,
+            version: $ver,
             busy: $busy,
             vm: $vm,
             guest: $guest,
@@ -1195,6 +1201,7 @@ _vmvpn() {
         'firefox:Launch Firefox with VPN proxy profile'
         'firefox-profile:Show Firefox profile info'
         'completion:Generate shell completion script'
+        'version:Print version'
     )
 
     local -a completion_shells
@@ -1263,6 +1270,9 @@ EOF
 }
 
 case "${1:-}" in
+    version|--version|-V)
+        echo "vmvpn $VMVPN_VERSION"
+        ;;
     start)
         run_locked start
         ;;
