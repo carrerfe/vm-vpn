@@ -221,7 +221,7 @@ status_json() {
             if [[ -n "$cfg_password" && "$cfg_password" != "null" ]]; then
                 password_source="config"
             elif command -v secret-tool >/dev/null 2>&1 && \
-                 timeout 5 secret-tool lookup service vmvpn gateway "$cfg_gateway" username "$cfg_username" >/dev/null 2>&1; then
+                 [[ -n $(timeout 5 secret-tool search service vmvpn gateway "$cfg_gateway" username "$cfg_username" 2>/dev/null) ]]; then
                 password_source="keyring"
             fi
         fi
