@@ -8,7 +8,7 @@ VPN_CONFIG="${VPN_CONFIG:-$SCRIPT_DIR/vpn-config.json}"
 CERT_FINGERPRINT_FILE="$SCRIPT_DIR/.vpn-cert-fingerprint"
 FIREFOX_PROFILE_NAME="vmvpn"
 
-COMMANDS="start stop restart shell ssh status delete vpn-connect vpn-disconnect vpn-status password-set password-clear cert-forget firefox firefox-profile completion"
+COMMANDS="start stop restart shell ssh status delete logs vpn-connect vpn-disconnect vpn-status password-set password-clear cert-forget firefox firefox-profile completion"
 
 usage() {
     echo "vmvpn - VM VPN CLI"
@@ -23,6 +23,8 @@ usage() {
     echo "  ssh             Connect via SSH"
     echo "  status [--json] Show VM status (--json: machine-readable output)"
     echo "  delete [-y]     Delete the VM completely (-y: skip confirmation)"
+    echo "  logs <source> [-n N]"
+    echo "                  Guest logs: journal, squid, forticlient (default: 200 lines)"
     echo ""
     echo "VPN Commands:"
     echo "  vpn-connect [--password-stdin] [--trust-fingerprint FP]"
@@ -52,7 +54,34 @@ usage() {
     echo "  3  server certificate needs confirmation (non-interactive)"
     echo "  4  password required but none available (non-interactive)"
     echo "  5  VPN config file missing or invalid"
+    echo "  6  another vmvpn operation is in progress (operation lock held)"
     exit 1
+}
+
+# Serialize mutating operations (start/stop/restart/delete/vpn-connect/
+# vpn-disconnect): the lock file lives in XDG_RUNTIME_DIR and is held on fd 9
+# for the lifetime of the process.
+take_operation_lock() {
+    local lock_file="${XDG_RUNTIME_DIR:-/tmp}/vmvpn-${VM_NAME}.lock"
+    exec 9>"$lock_file"
+    if ! flock -n 9; then
+        echo "Another vmvpn operation is in progress" >&2
+        exit 6
+    fi
+}
+
+# Take the lock, then run a command in a subshell with fd 9 closed so that
+# spawned processes (limactl -> hostagent -> qemu) do not inherit the lock fd
+# and keep it held after this script exits.
+run_locked() {
+    take_operation_lock
+    ( exec 9>&-; "$@" )
+}
+
+# True when another vmvpn process holds the operation lock.
+operation_in_progress() {
+    local lock_file="${XDG_RUNTIME_DIR:-/tmp}/vmvpn-${VM_NAME}.lock"
+    ( exec 9>"$lock_file"; flock -n 9 ) 2>/dev/null
 }
 
 check_lima() {
@@ -132,6 +161,12 @@ status() {
 # or the config file is missing (reported via exists/valid flags).
 status_json() {
     check_jq
+
+    # --- Operation lock state (some other vmvpn command is acting) ---
+    local busy=false
+    if ! operation_in_progress; then
+        busy=true
+    fi
 
     # --- VM (from `limactl list --json`, one object per line) ---
     local vm_json="" vm_obj
@@ -249,6 +284,7 @@ status_json() {
     fi
 
     jq -n \
+        --argjson busy "$busy" \
         --argjson vm "$vm_obj" \
         --argjson guest "$guest_json" \
         --arg vpnState "$vpn_state" \
@@ -270,6 +306,7 @@ status_json() {
         --arg certFp "$cert_fp" \
         '{
             schema: 1,
+            busy: $busy,
             vm: $vm,
             guest: $guest,
             vpn: {state: $vpnState, raw: $vpnRaw},
@@ -774,6 +811,76 @@ cert_forget() {
     fi
 }
 
+logs() {
+    local source="${1:-}"
+    local lines=200
+    if [[ $# -gt 0 ]]; then
+        shift
+    fi
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n)
+                if [[ $# -lt 2 || ! "$2" =~ ^[0-9]+$ ]]; then
+                    echo "Error: -n requires a number of lines" >&2
+                    exit 1
+                fi
+                lines="$2"
+                shift 2
+                ;;
+            *)
+                echo "Error: unknown option for logs: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    case "$source" in
+        journal|squid|forticlient) ;;
+        ""|-h|--help)
+            echo "Usage: vmvpn logs {journal|squid|forticlient} [-n N]" >&2
+            exit 1
+            ;;
+        *)
+            echo "Error: unknown log source: $source" >&2
+            echo "Sources: journal, squid, forticlient" >&2
+            exit 1
+            ;;
+    esac
+
+    check_lima
+    if ! limactl list 2>/dev/null | awk -v n="$VM_NAME" '$1 == n && $2 == "Running" { found=1 } END { exit !found }'; then
+        echo "Error: VM '$VM_NAME' is not running." >&2
+        exit 1
+    fi
+
+    case "$source" in
+        journal)
+            limactl shell "$VM_NAME" -- sudo journalctl -n "$lines" --no-pager
+            ;;
+        squid)
+            limactl shell "$VM_NAME" -- sudo bash -c '
+                for f in /var/log/squid/cache.log /var/log/squid/access.log; do
+                    echo "=== $f ==="
+                    tail -n '"$lines"' "$f" 2>/dev/null || echo "(missing)"
+                    echo
+                done
+            '
+            ;;
+        forticlient)
+            limactl shell "$VM_NAME" -- sudo bash -c '
+                for f in /var/log/forticlient/sslvpn.log \
+                         /var/log/forticlient/firewall.log \
+                         /var/log/forticlient/confighandler.log \
+                         /var/log/forticlient/fctsched.log; do
+                    echo "=== $f ==="
+                    tail -n '"$lines"' "$f" 2>/dev/null || echo "(missing)"
+                    echo
+                done
+            '
+            ;;
+    esac
+}
+
 start_socks_proxy() {
     local port="$1"
     
@@ -1017,7 +1124,10 @@ _vmvpn_completions() {
     
     case "$prev" in
         vmvpn)
-            COMPREPLY=($(compgen -W "start stop restart shell ssh status delete vpn-connect vpn-disconnect vpn-status password-set password-clear cert-forget firefox firefox-profile completion" -- "$cur"))
+            COMPREPLY=($(compgen -W "start stop restart shell ssh status delete logs vpn-connect vpn-disconnect vpn-status password-set password-clear cert-forget firefox firefox-profile completion" -- "$cur"))
+            ;;
+        logs)
+            COMPREPLY=($(compgen -W "journal squid forticlient -n" -- "$cur"))
             ;;
         completion)
             COMPREPLY=($(compgen -W "bash zsh" -- "$cur"))
@@ -1060,6 +1170,7 @@ _vmvpn() {
         'ssh:Connect via SSH'
         'status:Show VM status'
         'delete:Delete the VM completely'
+        'logs:Show guest logs (journal|squid|forticlient)'
         'vpn-connect:Connect to VPN (auto-starts VM and proxies)'
         'vpn-disconnect:Disconnect from VPN (stops proxies)'
         'vpn-status:Show VPN and proxy status'
@@ -1077,8 +1188,14 @@ _vmvpn() {
         'zsh:Generate zsh completion'
     )
 
-    local -a status_opts vpn_connect_opts delete_opts password_set_opts
+    local -a status_opts vpn_connect_opts delete_opts password_set_opts logs_opts
     status_opts=('--json:Machine-readable JSON output')
+    logs_opts=(
+        'journal:systemd journal'
+        'squid:Squid proxy logs'
+        'forticlient:FortiClient VPN logs'
+        '-n:Number of lines (default 200)'
+    )
     vpn_connect_opts=(
         '--password-stdin:Read VPN password from stdin'
         '--trust-fingerprint:Trust the presented certificate fingerprint'
@@ -1101,6 +1218,9 @@ _vmvpn() {
             ;;
         delete)
             _describe 'option' delete_opts
+            ;;
+        logs)
+            _describe 'option' logs_opts
             ;;
         password-set)
             _describe 'option' password_set_opts
@@ -1129,13 +1249,13 @@ EOF
 
 case "${1:-}" in
     start)
-        start
+        run_locked start
         ;;
     stop)
-        stop
+        run_locked stop
         ;;
     restart)
-        restart
+        run_locked restart
         ;;
     shell)
         shell
@@ -1151,13 +1271,16 @@ case "${1:-}" in
         esac
         ;;
     delete)
-        delete "${@:2}"
+        run_locked delete "${@:2}"
+        ;;
+    logs)
+        logs "${@:2}"
         ;;
     vpn-connect)
-        vpn_connect "${@:2}"
+        run_locked vpn_connect "${@:2}"
         ;;
     vpn-disconnect)
-        vpn_disconnect
+        run_locked vpn_disconnect
         ;;
     vpn-status)
         vpn_status

@@ -1,11 +1,14 @@
 """Unit tests for vmvpn_common (no Gtk). Run: python3 -m unittest discover -s gui/tests -v"""
 
+import json
 import os
+import re
 import stat
 import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -94,11 +97,17 @@ class FlowTestCase(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="vmvpn-test-")
         self.stub = CliStub(self.tmp)
         self._saved_env = {}
-        for name in ("VMVPN_CLI", "STUB_DIR", "XDG_STATE_HOME"):
+        for name in (
+            "VMVPN_CLI",
+            "STUB_DIR",
+            "XDG_STATE_HOME",
+            "XDG_CONFIG_HOME",
+        ):
             self._saved_env[name] = os.environ.get(name)
         os.environ["VMVPN_CLI"] = self.stub.path
         os.environ["STUB_DIR"] = self.stub.dir
         os.environ["XDG_STATE_HOME"] = os.path.join(self.tmp, "state")
+        os.environ["XDG_CONFIG_HOME"] = os.path.join(self.tmp, "config")
         self.done = None  # (rc, stdout, stderr)
 
     def tearDown(self):
@@ -316,6 +325,146 @@ class TestRunCliAndLog(FlowTestCase):
         )
         drive(lambda: "rc" in result)
         self.assertEqual(result["rc"], 1)
+
+    def test_run_cli_no_cli_found_reports_error(self):
+        result = {}
+        with unittest.mock.patch.object(vc, "find_cli", return_value=None):
+            vc.run_cli(
+                ["status", "--json"],
+                lambda rc, out, err: result.update(
+                    rc=rc, out=out, err=err
+                ),
+            )
+        drive(lambda: "rc" in result)
+        self.assertEqual(result["rc"], vc.EXIT_ERROR)
+        self.assertEqual(result["out"], "")
+        self.assertIn("CLI not found", result["err"])
+
+    def test_log_false_writes_nothing(self):
+        self.stub.add_step(rc=0, out='{"schema":1}\n')
+        result = {}
+        vc.run_cli(
+            ["status", "--json"],
+            lambda rc, out, err: result.update(
+                rc=rc, out=out, err=err
+            ),
+            log=False,
+        )
+        drive(lambda: "rc" in result)
+        self.assertEqual(result["rc"], 0)
+        self.assertFalse(os.path.exists(vc.gui_log_path()))
+
+    def test_status_poll_logger_logs_once_per_transition(self):
+        poll_log = vc.StatusPollLogger()
+        poll_log.report(False, "boom\n")
+        poll_log.report(False, "boom\n")
+        poll_log.report(True)
+        poll_log.report(False, "boom2\n")
+        with open(vc.gui_log_path(), encoding="utf-8") as f:
+            log = f.read()
+        self.assertEqual(log.count("status poll failing"), 2)
+        self.assertIn("boom", log)
+        self.assertIn("boom2", log)
+
+
+class TestAutostart(FlowTestCase):
+    def test_set_autostart_creates_and_removes_desktop_file(self):
+        tray = os.path.join(self.tmp, "vmvpn-tray")
+        self.assertFalse(vc.autostart_enabled())
+        vc.set_autostart(True, tray)
+        path = vc.autostart_path()
+        self.assertTrue(path.startswith(os.environ["XDG_CONFIG_HOME"]))
+        self.assertTrue(vc.autostart_enabled())
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("X-GNOME-Autostart-enabled=true", content)
+        vc.set_autostart(False, tray)
+        self.assertFalse(vc.autostart_enabled())
+        self.assertFalse(os.path.exists(path))
+
+    def test_exec_is_quoted_and_escaped(self):
+        tray = os.path.join(self.tmp, 'we`ird "dir"$', "my tray")
+        vc.set_autostart(True, tray)
+        with open(vc.autostart_path(), encoding="utf-8") as f:
+            exec_line = next(
+                l for l in f if l.startswith("Exec=")
+            ).rstrip("\n")
+        expected = 'Exec="%s"' % re.sub(
+            r"([" + '"' + "`$\\\\])", r"\\\1", tray
+        )
+        self.assertEqual(exec_line, expected)
+        # no unescaped specials inside the quotes
+        inner = exec_line[len('Exec="') : -1]
+        self.assertNotRegex(inner, r'(?<!\\)["`$]')
+
+
+class TestConfigHelpers(FlowTestCase):
+    def _cfg_path(self, name="vpn-config.json"):
+        return os.path.join(self.tmp, name)
+
+    def test_load_missing_returns_defaults_without_password(self):
+        cfg = vc.load_config(self._cfg_path("missing.json"))
+        self.assertIsInstance(cfg, dict)
+        example_path = os.path.join(
+            os.path.dirname(vc.__file__), "..", "vpn-config.json.example"
+        )
+        with open(example_path, encoding="utf-8") as f:
+            example = json.load(f)
+        example.pop("password", None)
+        self.assertEqual(cfg, example)
+        self.assertNotIn("password", cfg)
+
+    def test_load_invalid_returns_defaults(self):
+        path = self._cfg_path()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{ not json")
+        cfg = vc.load_config(path)
+        self.assertIn("gateway", cfg)
+
+    def test_save_roundtrip_preserves_unknown_keys_and_order(self):
+        path = self._cfg_path()
+        original = {
+            "gateway": "g.example.com",
+            "port": 443,
+            "username": "u",
+            "custom_extra": {"nested": 1},
+            "zzz_last": True,
+        }
+        vc.save_config(path, original)
+        cfg = vc.load_config(path)
+        cfg["username"] = "changed"
+        vc.save_config(path, cfg)
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        data = json.loads(text)
+        self.assertEqual(data["custom_extra"], {"nested": 1})
+        self.assertEqual(data["username"], "changed")
+        self.assertEqual(list(data), list(original))
+        # 2-space indentation and trailing newline
+        self.assertTrue(text.endswith("}\n"))
+        self.assertIn('\n  "gateway"', text)
+
+    def test_save_mode_0600_and_atomic_replace(self):
+        path = self._cfg_path()
+        vc.save_config(path, {"a": 1})
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        self.assertEqual(mode, 0o600)
+        # rewriting replaces the file; no temp files left behind
+        vc.save_config(path, {"a": 2})
+        self.assertEqual(vc.load_config(path), {"a": 2})
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        leftovers = [
+            n for n in os.listdir(self.tmp) if n.startswith(".vpn-config-")
+        ]
+        self.assertEqual(leftovers, [])
+
+    def test_key_removal_via_load_save_roundtrip(self):
+        path = self._cfg_path()
+        vc.save_config(path, {"gateway": "g", "password": "p", "x": 1})
+        cfg = vc.load_config(path)
+        del cfg["password"]
+        vc.save_config(path, cfg)
+        self.assertNotIn("password", vc.load_config(path))
 
 
 if __name__ == "__main__":

@@ -180,6 +180,7 @@ eval "$(./vmvpn completion zsh)"
 | `ssh`            | Connect via SSH                          |
 | `status`         | Show VM status (`--json` for machines)   |
 | `delete [-y]`    | Delete the VM and all its data           |
+| `logs SOURCE [-n N]` | Tail guest logs: `journal`, `squid`, `forticlient` |
 
 ### VPN Commands
 | Command          | Description                              |
@@ -271,11 +272,22 @@ printf '%s\n' "$PW" | vmvpn password-set --stdin  # store in GNOME keyring
 vmvpn password-clear                   # remove stored password
 vmvpn cert-forget                      # forget saved certificate fingerprint
 vmvpn delete -y                        # no confirmation prompt
+vmvpn logs journal -n 200              # tail the guest journal
+vmvpn logs squid                       # tail Squid cache/access logs
+vmvpn logs forticlient                 # tail FortiClient logs
 ```
 
 `status --json` always exits 0 and reports one object:
-`{schema, vm{name,exists,status,dir,cpus,memory_bytes,disk_bytes}, guest{mem_total_bytes,mem_used_bytes,mem_available_bytes,swap_total_bytes,swap_used_bytes,squid_active}|null, vpn{state,raw}, proxies{socks{enabled,port,running},http{enabled,port,running}}, config{path,exists,valid,gateway,port,username,password_source}, cert{path,fingerprint}}`.
+`{schema, busy, vm{name,exists,status,dir,cpus,memory_bytes,disk_bytes}, guest{mem_total_bytes,mem_used_bytes,mem_available_bytes,swap_total_bytes,swap_used_bytes,squid_active}|null, vpn{state,raw}, proxies{socks{enabled,port,running},http{enabled,port,running}}, config{path,exists,valid,gateway,port,username,password_source}, cert{path,fingerprint}}`.
 `vpn.state` is `connected`/`disconnected`/`unknown`; `password_source` is `config`/`keyring`/`none` (the password itself is never printed).
+`busy` is `true` while another `vmvpn` process holds the operation lock.
+
+**Operation lock:** `start`, `stop`, `restart`, `delete`, `vpn-connect` and
+`vpn-disconnect` take a non-blocking `flock` on
+`${XDG_RUNTIME_DIR:-/tmp}/vmvpn-${VM_NAME}.lock`. If another vmvpn operation
+is in progress they print `Another vmvpn operation is in progress` to stderr
+and exit `6`. `status --json` exposes the same state as `busy` so callers can
+poll without taking the lock.
 
 Password resolution order for `vpn-connect`: `--password-stdin` → `password`
 in the config file → GNOME keyring (`service vmvpn`) → interactive prompt.
@@ -284,7 +296,8 @@ in the config file → GNOME keyring (`service vmvpn`) → interactive prompt.
 `3` server certificate needs confirmation (stdout prints
 `VMVPN_CERT_UNTRUSTED new=<fp> saved=<fp>`) · `4` password required but none
 available (stderr prints `VMVPN_PASSWORD_REQUIRED`) · `5` VPN config file
-missing or invalid.
+missing or invalid · `6` another vmvpn operation is in progress (see the
+operation lock above).
 
 **Environment:** `VPN_CONFIG` overrides the config path (default
 `./vpn-config.json`); `VMVPN_VM_NAME` overrides the Lima VM name (default

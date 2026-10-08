@@ -52,10 +52,13 @@ class TrayApp:
         self.flow = None
         self.last_failed = False
         self.poll_in_flight = False
-        self.just_disconnected = False
+        self.user_action_pending = False  # suppress "connection lost" once
         self.indicator = None
         self.menu = None
         self._dialogs = []
+        self._menu_sig = None         # last built menu signature
+        self._icon = None             # last icon name set on the indicator
+        self._poll_log = vc.StatusPollLogger()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -112,19 +115,31 @@ class TrayApp:
         cfg = self._cfg()
         return bool(cfg.get("exists") and cfg.get("valid"))
 
+    def _status_busy(self):
+        """True when another vmvpn process holds the operation lock."""
+        return bool((self.status or {}).get("busy"))
+
+    def _busy(self):
+        """True while our own action or another process's operation runs."""
+        return self.action_running or self._status_busy()
+
     # -- polling -------------------------------------------------------------
 
     def _poll(self, *_args):
         if self.poll_in_flight:
             return GLib.SOURCE_CONTINUE
         self.poll_in_flight = True
-        vc.run_cli(["status", "--json"], self._on_polled)
+        vc.run_cli(["status", "--json"], self._on_polled, log=False)
         return GLib.SOURCE_CONTINUE
 
     def _on_polled(self, rc, stdout, stderr):
         self.poll_in_flight = False
+        prev_status = self.status
         prev_vpn_state = self._vpn().get("state")
+        prev_busy = bool((prev_status or {}).get("busy"))
         self.status = vc.parse_status(stdout) if rc == vc.EXIT_OK else None
+        new_busy = self._status_busy()
+        self._poll_log.report(self.status is not None, stderr)
 
         if self.action_running:
             return  # keep the data, but don't disturb the busy UI
@@ -133,20 +148,22 @@ class TrayApp:
         if (
             prev_vpn_state == "connected"
             and new_vpn_state == "disconnected"
-            and not self.just_disconnected
+            and not self.user_action_pending
+            and not prev_busy
+            and not new_busy
         ):
             self._notify(
                 "VPN connection lost",
                 "The VPN connection dropped.",
                 ICON_DISCONNECTED,
             )
-        self.just_disconnected = False
+        self.user_action_pending = False
         self._refresh_ui()
 
     # -- UI ------------------------------------------------------------------
 
     def _icon_name(self):
-        if self.action_running:
+        if self._busy():
             name = ICON_ACQUIRING
         elif self.last_failed or self.status is None:
             name = ICON_NO_ROUTE
@@ -163,7 +180,7 @@ class TrayApp:
     def _header_text(self):
         if self.action == "connect":
             return "Connecting…"
-        if self.action_running:
+        if self._busy():
             return "Working…"
         if self.status is None:
             return "Status unavailable"
@@ -181,7 +198,10 @@ class TrayApp:
         return "VPN: Disconnected"
 
     def _refresh_ui(self):
-        self.indicator.set_icon_full(self._icon_name(), "VM VPN")
+        icon = self._icon_name()
+        if icon != self._icon:
+            self._icon = icon
+            self.indicator.set_icon_full(icon, "VM VPN")
         self._rebuild_menu()
 
     @staticmethod
@@ -190,9 +210,51 @@ class TrayApp:
         item.show()
         return item
 
+    def _menu_signature(self):
+        """Tuple describing the menu model; rebuild only when it changes."""
+        busy = self._busy()
+        connected = self._connected()
+        proxies = self._proxies()
+        socks = proxies.get("socks") or {}
+        http = proxies.get("http") or {}
+
+        proxy_line = None
+        if connected:
+            parts = []
+            if socks.get("enabled") and socks.get("running"):
+                parts.append("SOCKS 127.0.0.1:%s" % socks.get("port"))
+            if http.get("enabled") and http.get("running"):
+                parts.append("HTTP 127.0.0.1:%s" % http.get("port"))
+            if parts:
+                proxy_line = " · ".join(parts)
+
+        window_bin = os.path.join(SCRIPT_DIR, "vmvpn-window")
+        window_visible = os.path.isfile(window_bin) and os.access(
+            window_bin, os.X_OK
+        )
+
+        return (
+            self._header_text(),
+            proxy_line,
+            "Disconnect" if connected else "Connect",
+            not busy and (connected or self._config_valid()),
+            not busy and connected,                      # firefox
+            bool(socks.get("enabled")), not busy,        # copy socks
+            bool(http.get("enabled")),                   # copy http
+            "Stop VM" if self._vm_running() else "Start VM",
+            not busy,
+            window_visible,
+            vc.autostart_enabled(), not busy,
+        )
+
     def _rebuild_menu(self):
+        sig = self._menu_signature()
+        if sig == self._menu_sig:
+            return
+        self._menu_sig = sig
+
         menu = Gtk.Menu()
-        busy = self.action_running
+        busy = self._busy()
 
         header = Gtk.MenuItem(label=self._header_text())
         header.set_sensitive(False)
@@ -279,7 +341,7 @@ class TrayApp:
             menu.append(open_item)
 
         autostart_item = Gtk.CheckMenuItem(label="Start at login")
-        autostart_item.set_active(os.path.exists(self._autostart_path()))
+        autostart_item.set_active(vc.autostart_enabled())
         autostart_item.set_sensitive(not busy)
         autostart_item.connect("toggled", self._on_autostart_toggled)
         autostart_item.show()
@@ -301,8 +363,9 @@ class TrayApp:
     # -- actions ---------------------------------------------------------------
 
     def _connect(self, *_args):
-        if self.action_running:
+        if self._busy():
             return
+        self.user_action_pending = True
         self.action_running = True
         self.action = "connect"
         self._refresh_ui()
@@ -342,8 +405,9 @@ class TrayApp:
             self._run_action("start", ["start"])
 
     def _run_action(self, action, args):
-        if self.action_running:
+        if self._busy():
             return
+        self.user_action_pending = True
         self.action_running = True
         self.action = action
         self._refresh_ui()
@@ -354,7 +418,6 @@ class TrayApp:
             if rc == vc.EXIT_OK:
                 self.last_failed = False
                 if action == "disconnect":
-                    self.just_disconnected = True
                     self._notify("VM VPN", "VPN disconnected.", ICON_DISCONNECTED)
             else:
                 self.last_failed = True
@@ -386,32 +449,8 @@ class TrayApp:
 
     # -- autostart ---------------------------------------------------------------
 
-    @staticmethod
-    def _autostart_path():
-        config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
-            os.path.expanduser("~"), ".config"
-        )
-        return os.path.join(config_home, "autostart", "vmvpn-tray.desktop")
-
     def _on_autostart_toggled(self, item):
-        path = self._autostart_path()
-        if item.get_active():
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            exec_path = os.path.realpath(__file__)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(
-                    "[Desktop Entry]\n"
-                    "Type=Application\n"
-                    "Name=VM VPN Tray\n"
-                    "Exec=%s\n"
-                    "Icon=network-vpn\n"
-                    "X-GNOME-Autostart-enabled=true\n" % exec_path
-                )
-        else:
-            try:
-                os.remove(path)
-            except FileNotFoundError:
-                pass
+        vc.set_autostart(item.get_active(), os.path.realpath(__file__))
 
     # -- dialogs -------------------------------------------------------------------
 
@@ -533,6 +572,11 @@ class TrayApp:
             pass  # silent fallback
 
     def _notify_failure(self, action, rc, stdout, stderr):
+        if rc == vc.EXIT_BUSY:
+            self._notify(
+                "Another vmvpn operation is in progress", "", ICON_NO_ROUTE
+            )
+            return
         if rc == vc.EXIT_LOGIN_FAILED:
             self._notify(
                 "VPN login failed", "Check your credentials.", ICON_NO_ROUTE

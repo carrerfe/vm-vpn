@@ -4,10 +4,12 @@ Only imports GLib/Gio so it can be reused by both the GTK3 tray and the
 GTK4 window process.
 """
 
+import copy
 import json
 import os
 import re
 import shutil
+import tempfile
 import time
 
 import gi
@@ -23,6 +25,7 @@ EXIT_LOGIN_FAILED = 2
 EXIT_CERT_UNTRUSTED = 3
 EXIT_PASSWORD_REQUIRED = 4
 EXIT_CONFIG_INVALID = 5
+EXIT_BUSY = 6
 
 _LOG_MAX_BYTES = 2 * 1024 * 1024
 _LOG_KEEP_BYTES = 1024 * 1024
@@ -85,18 +88,35 @@ def _log_result(rc, stdout, stderr):
     _append_log(buf)
 
 
-def run_cli(args, callback, stdin_text=""):
+def run_cli(args, callback, stdin_text="", log=True):
     """Run `vmvpn <args>` asynchronously.
 
     callback(rc, stdout, stderr) is invoked on the main loop. Stdin is always
     piped (closed when stdin_text is empty) so the CLI never sees a tty.
-    Every invocation is appended to the GUI log - except stdin_text, which may
-    carry the VPN password and is never logged.
+    Every invocation is appended to the GUI log when log=True - except
+    stdin_text, which may carry the VPN password and is never logged.
+    High-frequency callers (status polls) pass log=False and report failures
+    through StatusPollLogger instead.
     """
-    argv = [find_cli(), *args]
-    _append_log(
-        "[%s] $ %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), " ".join(argv))
-    )
+    cli = find_cli()
+    if cli is None:
+        _append_log(
+            "[%s] $ vmvpn %s\nvmvpn CLI not found\n"
+            % (time.strftime("%Y-%m-%d %H:%M:%S"), " ".join(args))
+        )
+
+        def _deliver():
+            callback(EXIT_ERROR, "", "vmvpn CLI not found")
+            return GLib.SOURCE_REMOVE
+
+        GLib.idle_add(_deliver)
+        return None
+
+    argv = [cli, *args]
+    if log:
+        _append_log(
+            "[%s] $ %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), " ".join(argv))
+        )
 
     try:
         proc = Gio.Subprocess.new(
@@ -106,7 +126,8 @@ def run_cli(args, callback, stdin_text=""):
             | Gio.SubprocessFlags.STDERR_PIPE,
         )
     except GLib.Error as exc:
-        _log_result(1, "", "spawn failed: %s" % exc.message)
+        if log:
+            _log_result(1, "", "spawn failed: %s" % exc.message)
         callback(EXIT_ERROR, "", "spawn failed: %s" % exc.message)
         return None
 
@@ -114,7 +135,8 @@ def run_cli(args, callback, stdin_text=""):
         try:
             _ok, stdout, stderr = proc.communicate_utf8_finish(result)
         except GLib.Error as exc:
-            _log_result(EXIT_ERROR, "", "communicate failed: %s" % exc.message)
+            if log:
+                _log_result(EXIT_ERROR, "", "communicate failed: %s" % exc.message)
             callback(EXIT_ERROR, "", "communicate failed: %s" % exc.message)
             return
         stdout = stdout or ""
@@ -122,11 +144,37 @@ def run_cli(args, callback, stdin_text=""):
         rc = proc.get_exit_status() if proc.get_if_exited() else EXIT_ERROR
         if proc.get_if_signaled():
             stderr += "\n[killed by signal %d]" % proc.get_term_sig()
-        _log_result(rc, stdout, stderr)
+        if log:
+            _log_result(rc, stdout, stderr)
         callback(rc, stdout, stderr)
 
     proc.communicate_utf8_async(stdin_text if stdin_text else None, None, _done)
     return proc
+
+
+class StatusPollLogger:
+    """Log a status-poll failure once per ok -> failing transition.
+
+    Status polls run with log=False so they do not spam gui.log. Feed every
+    poll result to report(); a failure is logged once (with stderr) until a
+    poll succeeds again.
+    """
+
+    def __init__(self):
+        self._failing = False
+
+    def report(self, ok, stderr=""):
+        if ok:
+            self._failing = False
+            return
+        if self._failing:
+            return
+        self._failing = True
+        detail = (stderr or "").strip() or "no error output"
+        _append_log(
+            "[%s] status poll failing: %s\n"
+            % (time.strftime("%Y-%m-%d %H:%M:%S"), detail)
+        )
 
 
 def parse_status(text):
@@ -144,6 +192,114 @@ def parse_cert_untrusted(stdout):
     if not match:
         return None
     return match.group(1), (match.group(2) or None)
+
+
+# -- autostart ---------------------------------------------------------------
+
+_AUTOSTART_DESKTOP = "vmvpn-tray.desktop"
+
+
+def autostart_path():
+    """Path of the tray's XDG autostart desktop entry."""
+    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config"
+    )
+    return os.path.join(config_home, "autostart", _AUTOSTART_DESKTOP)
+
+
+def autostart_enabled():
+    return os.path.exists(autostart_path())
+
+
+def _desktop_exec_quote(path):
+    """Quote an Exec value per the Desktop Entry spec.
+
+    Wrap in double quotes, backslash-escape `"` `` ` `` `$` `\\`.
+    """
+    return '"' + re.sub(r"([" + '"' + "`$\\\\])", r"\\\1", path) + '"'
+
+
+def set_autostart(enabled, tray_path):
+    """Create or remove the XDG autostart entry for the tray script."""
+    path = autostart_path()
+    if enabled:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(
+                "[Desktop Entry]\n"
+                "Type=Application\n"
+                "Name=VM VPN Tray\n"
+                "Exec=%s\n" % _desktop_exec_quote(os.path.realpath(tray_path))
+                + "Icon=network-vpn\n"
+                "X-GNOME-Autostart-enabled=true\n"
+            )
+    else:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+
+# -- config ------------------------------------------------------------------
+
+_CONFIG_DEFAULTS = {
+    "gateway": "vpn.example.com",
+    "port": 443,
+    "username": "your-username",
+    "socks_proxy": {
+        "enabled": True,
+        "port": 1080,
+        "auto_start": True,
+        "auto_stop": True,
+    },
+    "http_proxy": {
+        "enabled": False,
+        "port": 3128,
+        "auto_start": False,
+        "auto_stop": False,
+    },
+}
+
+
+def load_config(path):
+    """Load the VPN config as a dict (file order preserved).
+
+    A missing or unreadable file returns defaults matching
+    vpn-config.json.example (without a password key).
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return copy.deepcopy(_CONFIG_DEFAULTS)
+
+
+def save_config(path, data):
+    """Write the VPN config atomically: temp file + os.replace, mode 0600.
+
+    Round-trip through load_config and mutate the returned dict so unknown
+    keys and their order in the existing file are preserved. Writes with
+    2-space indentation and a trailing newline.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".vpn-config-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            os.fchmod(f.fileno(), 0o600)
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    os.chmod(path, 0o600)
 
 
 class ConnectFlow:
