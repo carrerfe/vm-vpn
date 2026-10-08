@@ -215,7 +215,7 @@ eval "$(./vmvpn completion zsh)"
 
 - **OS**: Ubuntu 24.04 LTS (cloud image)
 - **CPUs**: 2
-- **Memory**: 512 MiB + 4 GiB swap file (`vm.swappiness=100`), sized for 6-8 GB edge hosts
+- **Memory**: 512 MiB, sized for 6-8 GB edge hosts; optional guest swap (see Customization)
 - **Disk**: 20 GiB
 - **FortiClient**: 7.4.x (installed from official Fortinet repo)
 - Pre-installed tools: `curl`, `wget`, `vim`, `htop`, `net-tools`, `iproute2`
@@ -319,6 +319,18 @@ cpus: 2          # Number of CPUs
 memory: "512MiB" # RAM allocation
 disk: "20GiB"    # Disk size
 ```
+
+### Guest swap
+
+Guest swap and `vm.swappiness` are off by default. Enable them when the VM
+is created:
+
+```bash
+VMVPN_SWAP_SIZE=4G VMVPN_SWAPPINESS=100 vmvpn start
+```
+
+Both are baked into the instance at creation. To change them on an existing
+VM, recreate it: `vmvpn delete`, then start again with the variables set.
 
 ## License
 
