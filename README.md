@@ -171,15 +171,15 @@ eval "$(./vmvpn completion zsh)"
 ## Commands
 
 ### VM Commands
-| Command    | Description                    |
-|------------|--------------------------------|
-| `start`    | Create and start the VM        |
-| `stop`     | Stop the VM                    |
-| `restart`  | Restart the VM                 |
-| `shell`    | Open a shell in the VM         |
-| `ssh`      | Connect via SSH                |
-| `status`   | Show VM status                 |
-| `delete`   | Delete the VM and all its data |
+| Command          | Description                              |
+|------------------|------------------------------------------|
+| `start`          | Create and start the VM                  |
+| `stop`           | Stop the VM                              |
+| `restart`        | Restart the VM                           |
+| `shell`          | Open a shell in the VM                   |
+| `ssh`            | Connect via SSH                          |
+| `status`         | Show VM status (`--json` for machines)   |
+| `delete [-y]`    | Delete the VM and all its data           |
 
 ### VPN Commands
 | Command          | Description                              |
@@ -187,6 +187,9 @@ eval "$(./vmvpn completion zsh)"
 | `vpn-connect`    | Connect to VPN (auto-starts VM/proxies)  |
 | `vpn-disconnect` | Disconnect from VPN (stops proxies)      |
 | `vpn-status`     | Show VPN and proxy status                |
+| `password-set`   | Store VPN password in GNOME keyring      |
+| `password-clear` | Remove VPN password from GNOME keyring   |
+| `cert-forget`    | Forget saved certificate fingerprint     |
 
 ### Browser Commands
 | Command          | Description                              |
@@ -246,12 +249,46 @@ Create `vpn-config.json` with your VPN and proxy settings:
 }
 ```
 
-- **password**: Optional. If omitted, you'll be prompted interactively.
+- **password**: Optional. If omitted, the password is looked up in the GNOME keyring (see `password-set` below), or you'll be prompted interactively.
 - **socks_proxy**: SOCKS5 proxy via SSH (recommended for browsers)
 - **http_proxy**: Squid HTTP proxy
 - **auto_start/auto_stop**: Control proxy lifecycle with VPN connect/disconnect
 
 > **Note:** `vpn-config.json` is gitignored to protect your credentials.
+> Prefer storing the password in the GNOME keyring (`vmvpn password-set`)
+> instead of the plaintext `password` field.
+
+## Scripting / automation
+
+The CLI is non-interactive friendly: when stdin is not a TTY it never blocks on
+prompts — it uses the flags below and reports machine-parseable results.
+
+```bash
+vmvpn status --json                    # single JSON object (schema: 1)
+printf '%s\n' "$PW" | vmvpn vpn-connect --password-stdin
+vmvpn vpn-connect --trust-fingerprint AA:BB:...   # pre-trust a server cert
+printf '%s\n' "$PW" | vmvpn password-set --stdin  # store in GNOME keyring
+vmvpn password-clear                   # remove stored password
+vmvpn cert-forget                      # forget saved certificate fingerprint
+vmvpn delete -y                        # no confirmation prompt
+```
+
+`status --json` always exits 0 and reports one object:
+`{schema, vm{name,exists,status,dir,cpus,memory_bytes,disk_bytes}, guest{mem_total_bytes,mem_used_bytes,mem_available_bytes,swap_total_bytes,swap_used_bytes,squid_active}|null, vpn{state,raw}, proxies{socks{enabled,port,running},http{enabled,port,running}}, config{path,exists,valid,gateway,port,username,password_source}, cert{path,fingerprint}}`.
+`vpn.state` is `connected`/`disconnected`/`unknown`; `password_source` is `config`/`keyring`/`none` (the password itself is never printed).
+
+Password resolution order for `vpn-connect`: `--password-stdin` → `password`
+in the config file → GNOME keyring (`service vmvpn`) → interactive prompt.
+
+**Exit codes:** `0` success · `1` general/usage error · `2` VPN login failed ·
+`3` server certificate needs confirmation (stdout prints
+`VMVPN_CERT_UNTRUSTED new=<fp> saved=<fp>`) · `4` password required but none
+available (stderr prints `VMVPN_PASSWORD_REQUIRED`) · `5` VPN config file
+missing or invalid.
+
+**Environment:** `VPN_CONFIG` overrides the config path (default
+`./vpn-config.json`); `VMVPN_VM_NAME` overrides the Lima VM name (default
+`vmvpn`).
 
 ### Manual Connection (Inside VM)
 

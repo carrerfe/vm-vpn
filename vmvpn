@@ -2,13 +2,13 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VM_NAME="vmvpn"
+VM_NAME="${VMVPN_VM_NAME:-vmvpn}"
 VM_CONFIG="$SCRIPT_DIR/vmvpn.yaml"
 VPN_CONFIG="${VPN_CONFIG:-$SCRIPT_DIR/vpn-config.json}"
 CERT_FINGERPRINT_FILE="$SCRIPT_DIR/.vpn-cert-fingerprint"
 FIREFOX_PROFILE_NAME="vmvpn"
 
-COMMANDS="start stop restart shell ssh status delete vpn-connect vpn-disconnect vpn-status firefox firefox-profile completion"
+COMMANDS="start stop restart shell ssh status delete vpn-connect vpn-disconnect vpn-status password-set password-clear cert-forget firefox firefox-profile completion"
 
 usage() {
     echo "vmvpn - VM VPN CLI"
@@ -21,13 +21,17 @@ usage() {
     echo "  restart         Restart the VM"
     echo "  shell           Open a shell in the VM"
     echo "  ssh             Connect via SSH"
-    echo "  status          Show VM status"
-    echo "  delete          Delete the VM completely"
+    echo "  status [--json] Show VM status (--json: machine-readable output)"
+    echo "  delete [-y]     Delete the VM completely (-y: skip confirmation)"
     echo ""
     echo "VPN Commands:"
-    echo "  vpn-connect     Connect to VPN (auto-starts VM and proxies per config)"
+    echo "  vpn-connect [--password-stdin] [--trust-fingerprint FP]"
+    echo "                  Connect to VPN (auto-starts VM and proxies per config)"
     echo "  vpn-disconnect  Disconnect from VPN (stops proxies)"
     echo "  vpn-status      Show VPN and proxy status"
+    echo "  password-set [--stdin]   Store VPN password in GNOME keyring"
+    echo "  password-clear           Remove VPN password from GNOME keyring"
+    echo "  cert-forget              Forget saved VPN certificate fingerprint"
     echo ""
     echo "Browser Commands:"
     echo "  firefox         Launch Firefox with VPN proxy profile"
@@ -38,7 +42,16 @@ usage() {
     echo "  completion zsh    Output zsh completion script"
     echo ""
     echo "Environment variables:"
-    echo "  VPN_CONFIG      Path to VPN config JSON file (default: ./vpn-config.json)"
+    echo "  VPN_CONFIG       Path to VPN config JSON file (default: ./vpn-config.json)"
+    echo "  VMVPN_VM_NAME    Lima VM name to manage (default: vmvpn)"
+    echo ""
+    echo "Exit codes:"
+    echo "  0  success"
+    echo "  1  general error / usage"
+    echo "  2  VPN login failed"
+    echo "  3  server certificate needs confirmation (non-interactive)"
+    echo "  4  password required but none available (non-interactive)"
+    echo "  5  VPN config file missing or invalid"
     exit 1
 }
 
@@ -73,7 +86,11 @@ start() {
         limactl start "$VM_NAME"
     else
         echo "Creating and starting VM..."
-        limactl start --name="$VM_NAME" "$VM_CONFIG"
+        if [[ -t 0 ]]; then
+            limactl start --name="$VM_NAME" "$VM_CONFIG"
+        else
+            limactl start --tty=false --name="$VM_NAME" "$VM_CONFIG"
+        fi
     fi
     echo ""
     echo "VM is ready. Use '$0 shell' to access it."
@@ -111,22 +128,202 @@ status() {
     fi
 }
 
-delete() {
-    check_lima
-    echo "This will delete the VM and all its data."
-    read -p "Are you sure? [y/N] " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        limactl delete -f "$VM_NAME" 2>/dev/null || echo "VM does not exist."
-        echo "VM deleted."
-    else
-        echo "Cancelled."
+# Machine-readable status for scripting/GUI. Always exits 0, even when the VM
+# or the config file is missing (reported via exists/valid flags).
+status_json() {
+    check_jq
+
+    # --- VM (from `limactl list --json`, one object per line) ---
+    local vm_json="" vm_obj
+    if command -v limactl >/dev/null 2>&1; then
+        vm_json=$(limactl list --json 2>/dev/null | jq -c --arg n "$VM_NAME" 'select(.name == $n)' 2>/dev/null | head -n 1) || vm_json=""
     fi
+    if [[ -n "$vm_json" ]]; then
+        vm_obj=$(jq -c '{
+            name: .name,
+            exists: true,
+            status: (.status // "Unknown"),
+            dir: (.dir // null),
+            cpus: (.cpus // null),
+            memory_bytes: (.memory // null),
+            disk_bytes: (.disk // null)
+        }' <<<"$vm_json")
+    else
+        vm_obj=$(jq -nc --arg n "$VM_NAME" '{
+            name: $n, exists: false, status: "NotCreated",
+            dir: null, cpus: null, memory_bytes: null, disk_bytes: null
+        }')
+    fi
+    local vm_running=false
+    [[ $(jq -r '.status' <<<"$vm_obj") == "Running" ]] && vm_running=true
+
+    # --- Guest: one shell call for VPN status, memory and squid, split by markers ---
+    local guest_json="null" squid_active=false
+    local vpn_state="disconnected" vpn_raw=""
+    if [[ "$vm_running" == "true" ]]; then
+        local guest_out="" guest_rc=0
+        guest_out=$(limactl shell "$VM_NAME" -- sh -c '
+            echo ::VMVPN_VPN_STATUS::
+            /opt/forticlient/forticlient-cli vpn status 2>&1 || true
+            echo ::VMVPN_FREE::
+            free -b 2>/dev/null || true
+            echo ::VMVPN_SQUID::
+            systemctl is-active squid 2>/dev/null || true
+            exit 0
+        ' 2>/dev/null) || guest_rc=$?
+        if [[ $guest_rc -ne 0 ]]; then
+            vpn_state="unknown"
+        else
+            vpn_raw=$(awk '/^::VMVPN_VPN_STATUS::$/{f=1;next}/^::VMVPN_FREE::$/{f=0}f' <<<"$guest_out")
+            local free_out squid_state
+            free_out=$(awk '/^::VMVPN_FREE::$/{f=1;next}/^::VMVPN_SQUID::$/{f=0}f' <<<"$guest_out")
+            squid_state=$(awk '/^::VMVPN_SQUID::$/{f=1;next}f' <<<"$guest_out" | head -n 1)
+            [[ "$squid_state" == "active" ]] && squid_active=true
+            if grep -q "Status: Connected" <<<"$vpn_raw"; then
+                vpn_state="connected"
+            else
+                vpn_state="disconnected"
+            fi
+            local mem_total mem_used mem_avail swap_total swap_used
+            mem_total=$(awk '/^Mem:/{print $2}' <<<"$free_out")
+            mem_used=$(awk '/^Mem:/{print $3}' <<<"$free_out")
+            mem_avail=$(awk '/^Mem:/{print $7}' <<<"$free_out")
+            swap_total=$(awk '/^Swap:/{print $2}' <<<"$free_out")
+            swap_used=$(awk '/^Swap:/{print $3}' <<<"$free_out")
+            guest_json=$(jq -nc \
+                --argjson mt "${mem_total:-0}" --argjson mu "${mem_used:-0}" \
+                --argjson ma "${mem_avail:-0}" --argjson st "${swap_total:-0}" \
+                --argjson su "${swap_used:-0}" --argjson sq "$squid_active" \
+                '{mem_total_bytes:$mt, mem_used_bytes:$mu, mem_available_bytes:$ma,
+                  swap_total_bytes:$st, swap_used_bytes:$su, squid_active:$sq}')
+        fi
+    fi
+
+    # --- Config (never fatal here) ---
+    local cfg_exists=false cfg_valid=false cfg_gateway="" cfg_port="" cfg_username=""
+    local password_source="none"
+    local socks_enabled=true socks_port=1080 http_enabled=false http_port=3128
+    if [[ -f "$VPN_CONFIG" ]] && jq empty "$VPN_CONFIG" 2>/dev/null; then
+        cfg_exists=true
+        socks_enabled=$(jq -r '.socks_proxy.enabled // true' "$VPN_CONFIG")
+        socks_port=$(jq -r '.socks_proxy.port // 1080' "$VPN_CONFIG")
+        http_enabled=$(jq -r '.http_proxy.enabled // false' "$VPN_CONFIG")
+        http_port=$(jq -r '.http_proxy.port // 3128' "$VPN_CONFIG")
+        cfg_gateway=$(jq -r '.gateway // empty' "$VPN_CONFIG")
+        cfg_port=$(jq -r '.port // 443' "$VPN_CONFIG")
+        cfg_username=$(jq -r '.username // empty' "$VPN_CONFIG")
+        local cfg_password
+        cfg_password=$(jq -r '.password // empty' "$VPN_CONFIG")
+        [[ "$cfg_gateway" == "null" ]] && cfg_gateway=""
+        [[ "$cfg_username" == "null" ]] && cfg_username=""
+        if [[ -n "$cfg_gateway" && -n "$cfg_username" ]]; then
+            cfg_valid=true
+            if [[ -n "$cfg_password" && "$cfg_password" != "null" ]]; then
+                password_source="config"
+            elif command -v secret-tool >/dev/null 2>&1 && \
+                 timeout 5 secret-tool lookup service vmvpn gateway "$cfg_gateway" username "$cfg_username" >/dev/null 2>&1; then
+                password_source="keyring"
+            fi
+        fi
+    elif [[ -f "$VPN_CONFIG" ]]; then
+        cfg_exists=true
+    fi
+    [[ "$socks_enabled" == "true" || "$socks_enabled" == "false" ]] || socks_enabled=true
+    [[ "$http_enabled" == "true" || "$http_enabled" == "false" ]] || http_enabled=false
+    [[ "$socks_port" =~ ^[0-9]+$ ]] || socks_port=1080
+    [[ "$http_port" =~ ^[0-9]+$ ]] || http_port=3128
+
+    # --- Proxies ---
+    local socks_running=false http_running=false
+    if pgrep -f "ssh.*-D.*127.0.0.1:${socks_port}.*lima-${VM_NAME}" >/dev/null 2>&1; then
+        socks_running=true
+    fi
+    if [[ "$http_enabled" == "true" && "$squid_active" == "true" ]]; then
+        http_running=true
+    fi
+
+    # --- Saved certificate fingerprint ---
+    local cert_fp=""
+    if [[ -f "$CERT_FINGERPRINT_FILE" ]]; then
+        cert_fp=$(cat "$CERT_FINGERPRINT_FILE")
+    fi
+
+    jq -n \
+        --argjson vm "$vm_obj" \
+        --argjson guest "$guest_json" \
+        --arg vpnState "$vpn_state" \
+        --arg vpnRaw "$vpn_raw" \
+        --argjson socksEnabled "$socks_enabled" \
+        --argjson socksPort "$socks_port" \
+        --argjson socksRunning "$socks_running" \
+        --argjson httpEnabled "$http_enabled" \
+        --argjson httpPort "$http_port" \
+        --argjson httpRunning "$http_running" \
+        --arg cfgPath "$VPN_CONFIG" \
+        --argjson cfgExists "$cfg_exists" \
+        --argjson cfgValid "$cfg_valid" \
+        --arg cfgGateway "$cfg_gateway" \
+        --arg cfgPort "$cfg_port" \
+        --arg cfgUsername "$cfg_username" \
+        --arg pwSource "$password_source" \
+        --arg certPath "$CERT_FINGERPRINT_FILE" \
+        --arg certFp "$cert_fp" \
+        '{
+            schema: 1,
+            vm: $vm,
+            guest: $guest,
+            vpn: {state: $vpnState, raw: $vpnRaw},
+            proxies: {
+                socks: {enabled: $socksEnabled, port: $socksPort, running: $socksRunning},
+                http:  {enabled: $httpEnabled, port: $httpPort, running: $httpRunning}
+            },
+            config: {
+                path: $cfgPath,
+                exists: $cfgExists,
+                valid: $cfgValid,
+                gateway: (if $cfgValid then $cfgGateway else null end),
+                port: (if $cfgValid then ($cfgPort | tonumber? // null) else null end),
+                username: (if $cfgValid then $cfgUsername else null end),
+                password_source: $pwSource
+            },
+            cert: {
+                path: $certPath,
+                fingerprint: (if $certFp == "" then null else $certFp end)
+            }
+        }'
+}
+
+delete() {
+    local assume_yes=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -y|--yes) assume_yes=true ;;
+            *) echo "Error: unknown option for delete: $1" >&2; exit 1 ;;
+        esac
+        shift
+    done
+
+    check_lima
+    if [[ "$assume_yes" != "true" && ! -t 0 ]]; then
+        echo "Error: cannot confirm deletion non-interactively. Re-run with -y to proceed." >&2
+        exit 1
+    fi
+    echo "This will delete the VM and all its data."
+    if [[ "$assume_yes" != "true" ]]; then
+        read -p "Are you sure? [y/N] " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "Cancelled."
+            return 0
+        fi
+    fi
+    limactl delete -f "$VM_NAME" 2>/dev/null || echo "VM does not exist."
+    echo "VM deleted."
 }
 
 check_vpn_config() {
     if [[ ! -f "$VPN_CONFIG" ]]; then
-        echo "Error: VPN config file not found: $VPN_CONFIG"
+        echo "Error: VPN config file not found: $VPN_CONFIG" >&2
         echo ""
         echo "Create a vpn-config.json file with:"
         echo '{'
@@ -137,14 +334,18 @@ check_vpn_config() {
         echo '}'
         echo ""
         echo "Or copy the example: cp vpn-config.json.example vpn-config.json"
-        exit 1
+        exit 5
     fi
 }
 
 read_proxy_config() {
     check_jq
     check_vpn_config
-    
+    if ! jq empty "$VPN_CONFIG" 2>/dev/null; then
+        echo "Error: VPN config file is not valid JSON: $VPN_CONFIG" >&2
+        exit 5
+    fi
+
     # Proxy settings from config
     SOCKS_PROXY_ENABLED=$(jq -r '.socks_proxy.enabled // true' "$VPN_CONFIG")
     SOCKS_PROXY_PORT=$(jq -r '.socks_proxy.port // 1080' "$VPN_CONFIG")
@@ -158,37 +359,101 @@ read_proxy_config() {
 
 read_vpn_config() {
     read_proxy_config
-    
+
     VPN_GATEWAY=$(jq -r '.gateway' "$VPN_CONFIG")
     VPN_PORT=$(jq -r '.port // 443' "$VPN_CONFIG")
     VPN_USERNAME=$(jq -r '.username' "$VPN_CONFIG")
     VPN_PASSWORD=$(jq -r '.password // empty' "$VPN_CONFIG")
 
     if [[ -z "$VPN_GATEWAY" || "$VPN_GATEWAY" == "null" ]]; then
-        echo "Error: 'gateway' is required in $VPN_CONFIG"
-        exit 1
+        echo "Error: 'gateway' is required in $VPN_CONFIG" >&2
+        exit 5
     fi
     if [[ -z "$VPN_USERNAME" || "$VPN_USERNAME" == "null" ]]; then
-        echo "Error: 'username' is required in $VPN_CONFIG"
-        exit 1
+        echo "Error: 'username' is required in $VPN_CONFIG" >&2
+        exit 5
     fi
-    # If password is not in config, prompt for it interactively
-    if [[ -z "$VPN_PASSWORD" ]]; then
-        read -s -p "VPN Password for $VPN_USERNAME: " VPN_PASSWORD
-        echo ""
-        if [[ -z "$VPN_PASSWORD" ]]; then
-            echo "Error: Password cannot be empty"
-            exit 1
+}
+
+# Escape a string for safe interpolation inside a double-quoted Tcl string.
+tcl_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//\$/\\$}"
+    s="${s//\[/\\[}"
+    s="${s//\]/\\]}"
+    printf '%s' "$s"
+}
+
+# Resolve VPN_PASSWORD for non-interactive-friendly connection.
+# Order: --password-stdin > config "password" > GNOME keyring > tty prompt.
+resolve_vpn_password() {
+    if [[ "$VPN_PASSWORD_STDIN" == "true" ]]; then
+        local stdin_password=""
+        IFS= read -r stdin_password || true
+        if [[ -n "$stdin_password" ]]; then
+            VPN_PASSWORD="$stdin_password"
+            return 0
         fi
     fi
+
+    if [[ -n "$VPN_PASSWORD" ]]; then
+        return 0
+    fi
+
+    if command -v secret-tool >/dev/null 2>&1; then
+        VPN_PASSWORD=$(timeout 10 secret-tool lookup service vmvpn gateway "$VPN_GATEWAY" username "$VPN_USERNAME" 2>/dev/null || true)
+        if [[ -n "$VPN_PASSWORD" ]]; then
+            return 0
+        fi
+    fi
+
+    if [[ -t 0 ]]; then
+        read -rs -p "VPN Password for $VPN_USERNAME: " VPN_PASSWORD
+        echo ""
+        if [[ -z "$VPN_PASSWORD" ]]; then
+            echo "Error: Password cannot be empty" >&2
+            exit 1
+        fi
+        return 0
+    fi
+
+    echo "VMVPN_PASSWORD_REQUIRED" >&2
+    exit 4
 }
 
 check_certificate_fingerprint() {
     local new_fingerprint="$1"
+    local trust_fingerprint="${2:-}"
     local saved_fingerprint=""
 
     if [[ -f "$CERT_FINGERPRINT_FILE" ]]; then
         saved_fingerprint=$(cat "$CERT_FINGERPRINT_FILE")
+    fi
+
+    if [[ -n "$saved_fingerprint" && "$saved_fingerprint" == "$new_fingerprint" ]]; then
+        echo "Certificate fingerprint verified."
+        return 0
+    fi
+
+    if [[ -n "$trust_fingerprint" && "$trust_fingerprint" == "$new_fingerprint" ]]; then
+        echo "$new_fingerprint" > "$CERT_FINGERPRINT_FILE"
+        echo "Certificate fingerprint saved (trusted via --trust-fingerprint)."
+        return 0
+    fi
+
+    if [[ ! -t 0 ]]; then
+        echo "VMVPN_CERT_UNTRUSTED new=${new_fingerprint} saved=${saved_fingerprint}"
+        echo "Error: VPN server certificate is not trusted." >&2
+        echo "  Presented fingerprint: $new_fingerprint" >&2
+        if [[ -n "$saved_fingerprint" ]]; then
+            echo "  Saved fingerprint differs - this could indicate a MITM attack or a certificate update." >&2
+        else
+            echo "  No fingerprint saved yet." >&2
+        fi
+        echo "  To trust it, re-run interactively or pass: --trust-fingerprint $new_fingerprint" >&2
+        return 3
     fi
 
     if [[ -z "$saved_fingerprint" ]]; then
@@ -196,7 +461,7 @@ check_certificate_fingerprint() {
         echo "New VPN server certificate detected:"
         echo "  Fingerprint (SHA1): $new_fingerprint"
         echo ""
-        read -p "Trust this certificate and save fingerprint? (y/n) [n]: " response
+        read -r -p "Trust this certificate and save fingerprint? (y/n) [n]: " response
         if [[ "$response" =~ ^[Yy]$ ]]; then
             echo "$new_fingerprint" > "$CERT_FINGERPRINT_FILE"
             echo "Certificate fingerprint saved."
@@ -205,14 +470,14 @@ check_certificate_fingerprint() {
             echo "Certificate rejected. Aborting connection."
             return 1
         fi
-    elif [[ "$saved_fingerprint" != "$new_fingerprint" ]]; then
+    else
         echo ""
         echo "WARNING: VPN server certificate has CHANGED!"
         echo "  Saved fingerprint:  $saved_fingerprint"
         echo "  New fingerprint:    $new_fingerprint"
         echo ""
         echo "This could indicate a man-in-the-middle attack or a legitimate certificate update."
-        read -p "Accept the new certificate? (y/n) [n]: " response
+        read -r -p "Accept the new certificate? (y/n) [n]: " response
         if [[ "$response" =~ ^[Yy]$ ]]; then
             echo "$new_fingerprint" > "$CERT_FINGERPRINT_FILE"
             echo "New certificate fingerprint saved."
@@ -221,19 +486,20 @@ check_certificate_fingerprint() {
             echo "Certificate rejected. Aborting connection."
             return 1
         fi
-    else
-        echo "Certificate fingerprint verified."
-        return 0
     fi
 }
 
 ensure_vm_running() {
     check_lima
-    
+
     # Check if VM exists and is running
     if ! limactl list -q 2>/dev/null | grep -q "^${VM_NAME}$"; then
         echo "VM not found. Creating and starting..."
-        limactl start --name="$VM_NAME" "$VM_CONFIG"
+        if [[ -t 0 ]]; then
+            limactl start --name="$VM_NAME" "$VM_CONFIG"
+        else
+            limactl start --tty=false --name="$VM_NAME" "$VM_CONFIG"
+        fi
     elif ! limactl list 2>/dev/null | grep "^${VM_NAME}" | grep -q "Running"; then
         echo "Starting VM..."
         limactl start "$VM_NAME"
@@ -241,8 +507,38 @@ ensure_vm_running() {
 }
 
 vpn_connect() {
+    VPN_PASSWORD_STDIN=false
+    local trust_fingerprint=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --password-stdin)
+                VPN_PASSWORD_STDIN=true
+                ;;
+            --trust-fingerprint)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --trust-fingerprint requires a fingerprint argument" >&2
+                    exit 1
+                fi
+                trust_fingerprint="$2"
+                shift
+                ;;
+            *)
+                echo "Error: unknown option for vpn-connect: $1" >&2
+                exit 1
+                ;;
+        esac
+        shift
+    done
+
     read_vpn_config
+    resolve_vpn_password
     ensure_vm_running
+
+    local esc_gateway esc_port esc_username esc_password
+    esc_gateway=$(tcl_escape "$VPN_GATEWAY")
+    esc_port=$(tcl_escape "$VPN_PORT")
+    esc_username=$(tcl_escape "$VPN_USERNAME")
+    esc_password=$(tcl_escape "$VPN_PASSWORD")
 
     echo "Connecting to VPN: $VPN_GATEWAY:$VPN_PORT as $VPN_USERNAME..."
 
@@ -260,15 +556,15 @@ set timeout 30
 spawn /opt/forticlient/forticlient-cli vpn edit vpn-tunnel
 expect {
     \"Remote Gateway:\" {
-        send \"${VPN_GATEWAY}:${VPN_PORT}\r\"
+        send -- \"${esc_gateway}:${esc_port}\r\"
         exp_continue
     }
     \"Authentication\" {
-        send \"1\r\"
+        send -- \"1\r\"
         exp_continue
     }
     \"Certificate Type\" {
-        send \"3\r\"
+        send -- \"3\r\"
         exp_continue
     }
     eof
@@ -281,14 +577,14 @@ expect {
     local connect_script="
 set timeout 60
 log_user 1
-spawn /opt/forticlient/forticlient-cli vpn connect vpn-tunnel --user=${VPN_USERNAME} -p
+spawn /opt/forticlient/forticlient-cli vpn connect vpn-tunnel --user=${esc_username} -p
 expect {
     \"Password:\" {
-        send \"${VPN_PASSWORD}\r\"
+        send -- \"${esc_password}\r\"
         exp_continue
     }
     \"Please input password\" {
-        send \"${VPN_PASSWORD}\r\"
+        send -- \"${esc_password}\r\"
         exp_continue
     }
     -re \"Fingerprint \\\\(SHA1\\\\): (\[0-9A-Fa-f:\]+)\" {
@@ -297,7 +593,7 @@ expect {
         exp_continue
     }
     \"Confirm (y/n)\" {
-        send \"n\r\"
+        send -- \"n\r\"
     }
     eof
 }
@@ -310,8 +606,12 @@ expect {
 
     if [[ -n "$cert_fingerprint" ]]; then
         # Certificate confirmation was requested - verify fingerprint
-        if ! check_certificate_fingerprint "$cert_fingerprint"; then
-            return 1
+        local cert_rc=0
+        check_certificate_fingerprint "$cert_fingerprint" "$trust_fingerprint" || cert_rc=$?
+        if [[ $cert_rc -ne 0 ]]; then
+            # Disconnect the stuck connection from the first attempt before giving up
+            limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn disconnect 2>/dev/null || true
+            exit "$cert_rc"
         fi
 
         # Disconnect the stuck connection from first attempt before reconnecting
@@ -327,24 +627,24 @@ expect {
                 break
             fi
             sleep 1
-            (( waited++ ))
+            waited=$((waited + 1))
         done
 
         # Reconnect and accept the certificate
         local reconnect_script="
 set timeout 60
-spawn /opt/forticlient/forticlient-cli vpn connect vpn-tunnel --user=${VPN_USERNAME} -p
+spawn /opt/forticlient/forticlient-cli vpn connect vpn-tunnel --user=${esc_username} -p
 expect {
     \"Password:\" {
-        send \"${VPN_PASSWORD}\r\"
+        send -- \"${esc_password}\r\"
         exp_continue
     }
     \"Please input password\" {
-        send \"${VPN_PASSWORD}\r\"
+        send -- \"${esc_password}\r\"
         exp_continue
     }
     \"Confirm (y/n)\" {
-        send \"y\r\"
+        send -- \"y\r\"
         exp_continue
     }
     eof
@@ -361,19 +661,19 @@ expect {
     if echo "$connect_output" | grep -q "Login failed"; then
         echo ""
         echo "ERROR: VPN login failed. Please check your credentials."
-        return 1
+        exit 2
     fi
 
     # Verify VPN is actually connected
     sleep 2
     local vpn_status
     vpn_status=$(limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn status 2>&1 || true)
-    
+
     if ! echo "$vpn_status" | grep -q "Status: Connected"; then
         echo ""
         echo "ERROR: VPN connection failed."
         echo "$vpn_status"
-        return 1
+        exit 1
     fi
 
     # Start proxies if configured
@@ -405,11 +705,73 @@ vpn_disconnect() {
 vpn_status() {
     read_proxy_config
     check_lima
-    
+
     echo "VPN:"
     limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn status 2>/dev/null | sed 's/^/  /' || echo "  Not connected"
-    
+
     show_proxy_status
+}
+
+check_secret_tool() {
+    if ! command -v secret-tool >/dev/null 2>&1; then
+        echo "Error: secret-tool not found (required for keyring storage)." >&2
+        echo "Install it with: sudo apt install libsecret-tools" >&2
+        exit 1
+    fi
+}
+
+password_set() {
+    local use_stdin=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --stdin) use_stdin=true ;;
+            *) echo "Error: unknown option for password-set: $1" >&2; exit 1 ;;
+        esac
+        shift
+    done
+
+    read_vpn_config
+    check_secret_tool
+
+    local pw=""
+    if [[ "$use_stdin" == "true" ]]; then
+        IFS= read -r pw || true
+    elif [[ -t 0 ]]; then
+        read -rs -p "VPN Password for $VPN_USERNAME: " pw
+        echo ""
+    else
+        echo "VMVPN_PASSWORD_REQUIRED" >&2
+        exit 4
+    fi
+
+    if [[ -z "$pw" ]]; then
+        echo "Error: Password cannot be empty" >&2
+        exit 1
+    fi
+
+    printf '%s' "$pw" | secret-tool store --label="vmvpn: $VPN_USERNAME@$VPN_GATEWAY" \
+        service vmvpn gateway "$VPN_GATEWAY" username "$VPN_USERNAME"
+    echo "Password stored in GNOME keyring for $VPN_USERNAME@$VPN_GATEWAY."
+}
+
+password_clear() {
+    read_vpn_config
+    check_secret_tool
+
+    if secret-tool clear service vmvpn gateway "$VPN_GATEWAY" username "$VPN_USERNAME" 2>/dev/null; then
+        echo "Stored password removed from GNOME keyring for $VPN_USERNAME@$VPN_GATEWAY."
+    else
+        echo "No stored password found for $VPN_USERNAME@$VPN_GATEWAY."
+    fi
+}
+
+cert_forget() {
+    if [[ -f "$CERT_FINGERPRINT_FILE" ]]; then
+        rm -f "$CERT_FINGERPRINT_FILE"
+        echo "Saved certificate fingerprint removed: $CERT_FINGERPRINT_FILE"
+    else
+        echo "No saved certificate fingerprint ($CERT_FINGERPRINT_FILE)."
+    fi
 }
 
 start_socks_proxy() {
@@ -655,10 +1017,22 @@ _vmvpn_completions() {
     
     case "$prev" in
         vmvpn)
-            COMPREPLY=($(compgen -W "start stop restart shell ssh status delete vpn-connect vpn-disconnect vpn-status firefox firefox-profile completion" -- "$cur"))
+            COMPREPLY=($(compgen -W "start stop restart shell ssh status delete vpn-connect vpn-disconnect vpn-status password-set password-clear cert-forget firefox firefox-profile completion" -- "$cur"))
             ;;
         completion)
             COMPREPLY=($(compgen -W "bash zsh" -- "$cur"))
+            ;;
+        status)
+            COMPREPLY=($(compgen -W "--json" -- "$cur"))
+            ;;
+        vpn-connect)
+            COMPREPLY=($(compgen -W "--password-stdin --trust-fingerprint" -- "$cur"))
+            ;;
+        delete)
+            COMPREPLY=($(compgen -W "-y --yes" -- "$cur"))
+            ;;
+        password-set)
+            COMPREPLY=($(compgen -W "--stdin" -- "$cur"))
             ;;
         *)
             COMPREPLY=()
@@ -689,20 +1063,47 @@ _vmvpn() {
         'vpn-connect:Connect to VPN (auto-starts VM and proxies)'
         'vpn-disconnect:Disconnect from VPN (stops proxies)'
         'vpn-status:Show VPN and proxy status'
+        'password-set:Store VPN password in GNOME keyring'
+        'password-clear:Remove VPN password from GNOME keyring'
+        'cert-forget:Forget saved VPN certificate fingerprint'
         'firefox:Launch Firefox with VPN proxy profile'
         'firefox-profile:Show Firefox profile info'
         'completion:Generate shell completion script'
     )
-    
+
     local -a completion_shells
     completion_shells=(
         'bash:Generate bash completion'
         'zsh:Generate zsh completion'
     )
-    
+
+    local -a status_opts vpn_connect_opts delete_opts password_set_opts
+    status_opts=('--json:Machine-readable JSON output')
+    vpn_connect_opts=(
+        '--password-stdin:Read VPN password from stdin'
+        '--trust-fingerprint:Trust the presented certificate fingerprint'
+    )
+    delete_opts=(
+        '-y:Skip confirmation prompt'
+        '--yes:Skip confirmation prompt'
+    )
+    password_set_opts=('--stdin:Read password from stdin')
+
     case "$words[2]" in
         completion)
             _describe 'shell' completion_shells
+            ;;
+        status)
+            _describe 'option' status_opts
+            ;;
+        vpn-connect)
+            _describe 'option' vpn_connect_opts
+            ;;
+        delete)
+            _describe 'option' delete_opts
+            ;;
+        password-set)
+            _describe 'option' password_set_opts
             ;;
         *)
             _describe 'command' commands
@@ -743,19 +1144,32 @@ case "${1:-}" in
         ssh_connect
         ;;
     status)
-        status
+        case "${2:-}" in
+            --json) status_json ;;
+            "") status ;;
+            *) echo "Error: unknown option for status: $2" >&2; exit 1 ;;
+        esac
         ;;
     delete)
-        delete
+        delete "${@:2}"
         ;;
     vpn-connect)
-        vpn_connect
+        vpn_connect "${@:2}"
         ;;
     vpn-disconnect)
         vpn_disconnect
         ;;
     vpn-status)
         vpn_status
+        ;;
+    password-set)
+        password_set "${@:2}"
+        ;;
+    password-clear)
+        password_clear
+        ;;
+    cert-forget)
+        cert_forget
         ;;
     firefox)
         launch_firefox "${@:2}"
