@@ -131,9 +131,6 @@ hostResolver:
   hosts:
     host.lima.internal: host.lima.internal
 
-networks:
-  - lima: user-v2
-
 message: |
   Ubuntu 24.04 LTS VM for FortiClient VPN is ready!
   
