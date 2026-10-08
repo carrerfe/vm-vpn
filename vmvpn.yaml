@@ -16,24 +16,32 @@ containerd:
   system: false
   user: false
 
+param:
+  SWAP_SIZE: ""
+  SWAPPINESS: ""
+
 provision:
   - mode: system
     script: |
       #!/bin/bash
       set -eux -o pipefail
 
-      # 4 GiB swap file to compensate for the small RAM allocation
-      if [ ! -f /swapfile ]; then
-        fallocate -l 4G /swapfile
-        chmod 600 /swapfile
-        mkswap /swapfile
+      # Optional swap file to compensate for the small RAM allocation
+      if [ -n "${PARAM_SWAP_SIZE:-}" ]; then
+        if [ ! -f /swapfile ]; then
+          fallocate -l "${PARAM_SWAP_SIZE}" /swapfile
+          chmod 600 /swapfile
+          mkswap /swapfile
+        fi
+        grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        swapon --show=NAME --noheadings | grep -qx /swapfile || swapon /swapfile
       fi
-      grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-      swapon --show=NAME --noheadings | grep -qx /swapfile || swapon /swapfile
 
       # Prefer swapping out idle anonymous memory over OOM-killing
-      echo 'vm.swappiness=100' > /etc/sysctl.d/99-vmvpn-swap.conf
-      sysctl -p /etc/sysctl.d/99-vmvpn-swap.conf
+      if [ -n "${PARAM_SWAPPINESS:-}" ]; then
+        echo "vm.swappiness=${PARAM_SWAPPINESS}" > /etc/sysctl.d/99-vmvpn-swap.conf
+        sysctl -p /etc/sysctl.d/99-vmvpn-swap.conf
+      fi
 
   - mode: system
     script: |
@@ -130,9 +138,6 @@ hostResolver:
   enabled: true
   hosts:
     host.lima.internal: host.lima.internal
-
-networks:
-  - lima: user-v2
 
 message: |
   Ubuntu 24.04 LTS VM for FortiClient VPN is ready!

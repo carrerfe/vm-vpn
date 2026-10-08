@@ -7,6 +7,7 @@ VM_CONFIG="$SCRIPT_DIR/vmvpn.yaml"
 VPN_CONFIG="${VPN_CONFIG:-$SCRIPT_DIR/vpn-config.json}"
 CERT_FINGERPRINT_FILE="$SCRIPT_DIR/.vpn-cert-fingerprint"
 FIREFOX_PROFILE_NAME="vmvpn"
+START_TIMEOUT="30m"
 
 COMMANDS="start stop restart shell ssh status delete logs vpn-connect vpn-disconnect vpn-status password-set password-clear cert-forget firefox firefox-profile completion"
 
@@ -44,8 +45,10 @@ usage() {
     echo "  completion zsh    Output zsh completion script"
     echo ""
     echo "Environment variables:"
-    echo "  VPN_CONFIG       Path to VPN config JSON file (default: ./vpn-config.json)"
-    echo "  VMVPN_VM_NAME    Lima VM name to manage (default: vmvpn)"
+    echo "  VPN_CONFIG        Path to VPN config JSON file (default: ./vpn-config.json)"
+    echo "  VMVPN_VM_NAME     Lima VM name to manage (default: vmvpn)"
+    echo "  VMVPN_SWAP_SIZE   Guest swap file size, applied at VM creation (e.g. 4G; default: no swap)"
+    echo "  VMVPN_SWAPPINESS  Guest vm.swappiness, applied at VM creation (e.g. 100; default: kernel default)"
     echo ""
     echo "Exit codes:"
     echo "  0  success"
@@ -108,18 +111,34 @@ check_jq() {
     fi
 }
 
+create_vm() {
+    local args=(--name="$VM_NAME" --timeout="$START_TIMEOUT")
+    [[ -t 0 ]] || args+=(--tty=false)
+    if [[ -n "${VMVPN_SWAP_SIZE:-}" ]]; then
+        if [[ ! "$VMVPN_SWAP_SIZE" =~ ^[1-9][0-9]*[KMG]?$ ]]; then
+            echo "Error: VMVPN_SWAP_SIZE must look like 4G, 512M or 1048576K"
+            exit 1
+        fi
+        args+=(--set ".param.SWAP_SIZE = \"$VMVPN_SWAP_SIZE\"")
+    fi
+    if [[ -n "${VMVPN_SWAPPINESS:-}" ]]; then
+        if [[ ! "$VMVPN_SWAPPINESS" =~ ^[0-9]+$ ]] || (( 10#$VMVPN_SWAPPINESS > 200 )); then
+            echo "Error: VMVPN_SWAPPINESS must be an integer between 0 and 200"
+            exit 1
+        fi
+        args+=(--set ".param.SWAPPINESS = \"$VMVPN_SWAPPINESS\"")
+    fi
+    limactl start "${args[@]}" "$VM_CONFIG"
+}
+
 start() {
     check_lima
     if limactl list -q | grep -q "^${VM_NAME}$"; then
         echo "Starting existing VM..."
-        limactl start "$VM_NAME"
+        limactl start --timeout="$START_TIMEOUT" "$VM_NAME"
     else
         echo "Creating and starting VM..."
-        if [[ -t 0 ]]; then
-            limactl start --name="$VM_NAME" "$VM_CONFIG"
-        else
-            limactl start --tty=false --name="$VM_NAME" "$VM_CONFIG"
-        fi
+        create_vm
     fi
     echo ""
     echo "VM is ready. Use '$0 shell' to access it."
@@ -532,14 +551,10 @@ ensure_vm_running() {
     # Check if VM exists and is running
     if ! limactl list -q 2>/dev/null | grep -q "^${VM_NAME}$"; then
         echo "VM not found. Creating and starting..."
-        if [[ -t 0 ]]; then
-            limactl start --name="$VM_NAME" "$VM_CONFIG"
-        else
-            limactl start --tty=false --name="$VM_NAME" "$VM_CONFIG"
-        fi
+        create_vm
     elif ! limactl list 2>/dev/null | grep "^${VM_NAME}" | grep -q "Running"; then
         echo "Starting VM..."
-        limactl start "$VM_NAME"
+        limactl start --timeout="$START_TIMEOUT" "$VM_NAME"
     fi
 }
 
