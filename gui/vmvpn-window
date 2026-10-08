@@ -1,0 +1,1388 @@
+#!/usr/bin/env python3
+"""vmvpn control window - GTK4 + libadwaita."""
+
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gio, GLib, GObject, Gtk
+
+import vmvpn_common as vc
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+TRAY_PATH = os.path.join(SCRIPT_DIR, "vmvpn-tray")
+POLL_SECONDS = 5
+GUEST_LOG_SECONDS = 10
+FILE_WATCH_SECONDS = 2
+FILE_TAIL_BYTES = 256 * 1024
+LOG_MAX_LINES = 2000
+
+ICON_CONNECTED = "network-vpn-symbolic"
+ICON_ACQUIRING = "network-vpn-acquiring-symbolic"
+ICON_DISCONNECTED = "network-vpn-disconnected-symbolic"
+ICON_DISABLED = "network-vpn-disabled-symbolic"
+ICON_NO_ROUTE = "network-vpn-no-route-symbolic"
+ICON_FALLBACK = "network-vpn"
+
+
+def _fmt_size(num):
+    if num is None:
+        return "—"
+    return GLib.format_size(int(num))
+
+
+def _last_line(text):
+    for line in reversed((text or "").splitlines()):
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def _escape(text):
+    return GLib.markup_escape_text(text or "")
+
+
+class StatusPage(Gtk.Box):
+    def __init__(self, win):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self.win = win
+
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        header.set_margin_top(18)
+        header.set_margin_bottom(6)
+        header.set_margin_start(24)
+        header.set_margin_end(24)
+        self.icon = Gtk.Image(icon_name=ICON_DISABLED)
+        self.icon.set_pixel_size(48)
+        header.append(self.icon)
+        text_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER
+        )
+        self.title_label = Gtk.Label(xalign=0.0)
+        self.title_label.add_css_class("title-1")
+        self.subtitle_label = Gtk.Label(xalign=0.0)
+        self.subtitle_label.add_css_class("dim-label")
+        text_box.append(self.title_label)
+        text_box.append(self.subtitle_label)
+        header.append(text_box)
+        self.append(header)
+
+        page = Adw.PreferencesPage()
+        page.set_vexpand(True)
+
+        # -- VPN group -------------------------------------------------------
+        vpn_group = Adw.PreferencesGroup(title="VPN")
+        self.row_state = Adw.ActionRow(title="Connection")
+        self.conn_button = Gtk.Button(label="Connect", valign=Gtk.Align.CENTER)
+        self.conn_button.connect("clicked", self.win._on_connect_clicked)
+        self.row_state.add_suffix(self.conn_button)
+        vpn_group.add(self.row_state)
+        self.row_gateway = Adw.ActionRow(title="Gateway")
+        self.row_username = Adw.ActionRow(title="Username")
+        vpn_group.add(self.row_gateway)
+        vpn_group.add(self.row_username)
+
+        self.row_socks = Adw.ActionRow(title="SOCKS proxy")
+        self.socks_copy = Gtk.Button(
+            icon_name="edit-copy-symbolic",
+            valign=Gtk.Align.CENTER,
+            tooltip_text="Copy SOCKS proxy address",
+        )
+        self.socks_copy.add_css_class("flat")
+        self.socks_copy.connect(
+            "clicked", lambda *_: self.win._copy_proxy("socks")
+        )
+        self.row_socks.add_suffix(self.socks_copy)
+        vpn_group.add(self.row_socks)
+
+        self.row_http = Adw.ActionRow(title="HTTP proxy")
+        self.http_copy = Gtk.Button(
+            icon_name="edit-copy-symbolic",
+            valign=Gtk.Align.CENTER,
+            tooltip_text="Copy HTTP proxy address",
+        )
+        self.http_copy.add_css_class("flat")
+        self.http_copy.connect(
+            "clicked", lambda *_: self.win._copy_proxy("http")
+        )
+        self.row_http.add_suffix(self.http_copy)
+        vpn_group.add(self.row_http)
+
+        self.firefox_row = Adw.ActionRow(title="Launch VPN Firefox")
+        self.firefox_btn = Gtk.Button(label="Launch", valign=Gtk.Align.CENTER)
+        self.firefox_btn.add_css_class("suggested-action")
+        self.firefox_btn.connect("clicked", self.win._on_firefox)
+        self.firefox_row.add_suffix(self.firefox_btn)
+        vpn_group.add(self.firefox_row)
+
+        self.raw_expander = Adw.ExpanderRow(title="Raw VPN status")
+        self.raw_label = Gtk.Label(xalign=0.0)
+        self.raw_label.set_margin_top(6)
+        self.raw_label.set_margin_bottom(6)
+        self.raw_label.set_margin_start(12)
+        self.raw_label.set_margin_end(12)
+        self.raw_label.set_selectable(True)
+        self.raw_label.set_wrap(True)
+        raw_row = Gtk.ListBoxRow()
+        raw_row.set_activatable(False)
+        raw_row.set_child(self.raw_label)
+        self.raw_expander.add_row(raw_row)
+        vpn_group.add(self.raw_expander)
+        page.add(vpn_group)
+
+        # -- Virtual machine group -------------------------------------------
+        vm_group = Adw.PreferencesGroup(title="Virtual machine")
+        self.row_vm_name = Adw.ActionRow(title="Name")
+        self.row_vm_status = Adw.ActionRow(title="Status")
+        vm_group.add(self.row_vm_name)
+        self.row_vm_cpus = Adw.ActionRow(title="CPUs")
+        self.row_vm_mem = Adw.ActionRow(title="Configured memory")
+        self.row_vm_disk = Adw.ActionRow(title="Disk")
+        vm_group.add(self.row_vm_status)
+        vm_group.add(self.row_vm_cpus)
+        vm_group.add(self.row_vm_mem)
+        vm_group.add(self.row_vm_disk)
+
+        self.row_guest_mem = Adw.ActionRow(title="Guest memory")
+        self.guest_mem_bar = Gtk.LevelBar()
+        self.guest_mem_bar.set_size_request(140, -1)
+        self.guest_mem_bar.set_valign(Gtk.Align.CENTER)
+        self.row_guest_mem.add_suffix(self.guest_mem_bar)
+        vm_group.add(self.row_guest_mem)
+
+        self.row_guest_swap = Adw.ActionRow(title="Guest swap")
+        self.guest_swap_bar = Gtk.LevelBar()
+        self.guest_swap_bar.set_size_request(140, -1)
+        self.guest_swap_bar.set_valign(Gtk.Align.CENTER)
+        self.row_guest_swap.add_suffix(self.guest_swap_bar)
+        vm_group.add(self.row_guest_swap)
+
+        self.row_squid = Adw.ActionRow(title="Squid")
+        vm_group.add(self.row_squid)
+
+        self.row_power = Adw.ActionRow(title="Power")
+        power_box = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=6,
+            valign=Gtk.Align.CENTER,
+        )
+        self.btn_start = Gtk.Button(label="Start")
+        self.btn_stop = Gtk.Button(label="Stop")
+        self.btn_restart = Gtk.Button(label="Restart")
+        self.btn_start.add_css_class("suggested-action")
+        self.btn_stop.add_css_class("destructive-action")
+        self.btn_start.connect(
+            "clicked", lambda *_: self.win.run_action("Start VM", ["start"])
+        )
+        self.btn_stop.connect(
+            "clicked", lambda *_: self.win.run_action("Stop VM", ["stop"])
+        )
+        self.btn_restart.connect(
+            "clicked", lambda *_: self.win.run_action("Restart VM", ["restart"])
+        )
+        power_box.append(self.btn_start)
+        power_box.append(self.btn_stop)
+        power_box.append(self.btn_restart)
+        self.row_power.add_suffix(power_box)
+        vm_group.add(self.row_power)
+        page.add(vm_group)
+
+        # -- Configuration group ---------------------------------------------
+        cfg_group = Adw.PreferencesGroup(title="Configuration")
+        self.row_cfg_file = Adw.ActionRow(title="Config file")
+        self.cfg_state_label = Gtk.Label(valign=Gtk.Align.CENTER)
+        self.row_cfg_file.add_suffix(self.cfg_state_label)
+        cfg_group.add(self.row_cfg_file)
+        self.row_password = Adw.ActionRow(title="Password")
+        cfg_group.add(self.row_password)
+        self.row_cert = Adw.ActionRow(title="Certificate fingerprint")
+        cfg_group.add(self.row_cert)
+        self.row_refresh = Adw.ActionRow(title="Last refresh")
+        refresh_btn = Gtk.Button(
+            icon_name="view-refresh-symbolic",
+            valign=Gtk.Align.CENTER,
+            tooltip_text="Refresh",
+        )
+        refresh_btn.add_css_class("flat")
+        refresh_btn.connect("clicked", lambda *_: self.win.refresh_now())
+        self.row_refresh.add_suffix(refresh_btn)
+        cfg_group.add(self.row_refresh)
+        page.add(cfg_group)
+
+        self.append(page)
+        self._last_refresh = "—"
+
+    # -- update ---------------------------------------------------------------
+
+    def update(self, status, busy, action, last_failed):
+        st = status or {}
+        vm = st.get("vm") or {}
+        guest = st.get("guest") or {}
+        vpn = st.get("vpn") or {}
+        proxies = st.get("proxies") or {}
+        cfg = st.get("config") or {}
+        cert = st.get("cert") or {}
+
+        connected = vpn.get("state") == "connected"
+        vm_running = vm.get("status") == "Running"
+        config_valid = bool(cfg.get("exists") and cfg.get("valid"))
+
+        # Header ------------------------------------------------------------
+        if action == "connect":
+            title, sub, icon = "Connecting…", "Hold on", ICON_ACQUIRING
+        elif busy:
+            title, sub, icon = "Working…", "", ICON_ACQUIRING
+        elif status is None:
+            title, sub, icon = "Status unavailable", "", ICON_NO_ROUTE
+        elif not config_valid:
+            title = "Not configured"
+            sub = cfg.get("path") or ""
+            icon = ICON_DISABLED
+        elif not vm.get("exists"):
+            title, sub, icon = "VM not created", "", ICON_DISABLED
+        elif not vm_running:
+            title, sub, icon = "VM stopped", "", ICON_DISABLED
+        elif connected:
+            title = "Connected — %s" % (cfg.get("gateway") or "")
+            sub = ""
+            icon = ICON_CONNECTED
+        else:
+            title, sub, icon = "Disconnected", "", ICON_DISCONNECTED
+        if last_failed and not busy:
+            icon = ICON_NO_ROUTE
+        self.icon.set_from_icon_name(icon)
+        self.title_label.set_label(title)
+        self.subtitle_label.set_label(sub)
+        self.subtitle_label.set_visible(bool(sub))
+
+        # VPN group ----------------------------------------------------------
+        self.row_state.set_subtitle(
+            {
+                "connected": "Connected",
+                "disconnected": "Disconnected",
+                "unknown": "Unknown",
+            }.get(vpn.get("state") or "", "—")
+        )
+        if connected:
+            self.conn_button.set_label("Disconnect")
+            self.conn_button.remove_css_class("suggested-action")
+            self.conn_button.add_css_class("destructive-action")
+            self.conn_button.set_sensitive(not busy)
+        else:
+            self.conn_button.set_label("Connect")
+            self.conn_button.remove_css_class("destructive-action")
+            self.conn_button.add_css_class("suggested-action")
+            self.conn_button.set_sensitive(
+                not busy and config_valid and vm_running
+            )
+        self.row_gateway.set_subtitle(str(cfg.get("gateway") or "—"))
+        self.row_username.set_subtitle(str(cfg.get("username") or "—"))
+
+        socks = proxies.get("socks") or {}
+        http = proxies.get("http") or {}
+        self._proxy_row(self.row_socks, self.socks_copy, socks)
+        self._proxy_row(self.row_http, self.http_copy, http)
+
+        self.firefox_btn.set_sensitive(not busy and connected)
+
+        raw = vpn.get("raw") or ""
+        self.raw_label.set_markup(
+            "<tt>%s</tt>" % _escape(raw if raw else "(no output)")
+        )
+
+        # VM group ------------------------------------------------------------
+        self.row_vm_name.set_subtitle(str(vm.get("name") or "—"))
+        self.row_vm_status.set_subtitle(
+            str(vm.get("status") or ("Not created" if not vm.get("exists") else "—"))
+        )
+        self.row_vm_cpus.set_subtitle(str(vm.get("cpus") or "—"))
+        self.row_vm_mem.set_subtitle(_fmt_size(vm.get("memory_bytes")))
+        self.row_vm_disk.set_subtitle(_fmt_size(vm.get("disk_bytes")))
+
+        if guest:
+            self._levelbar_row(
+                self.row_guest_mem,
+                self.guest_mem_bar,
+                guest.get("mem_used_bytes"),
+                guest.get("mem_total_bytes"),
+            )
+            self._levelbar_row(
+                self.row_guest_swap,
+                self.guest_swap_bar,
+                guest.get("swap_used_bytes"),
+                guest.get("swap_total_bytes"),
+            )
+            self.row_squid.set_subtitle(
+                "active" if guest.get("squid_active") else "inactive"
+            )
+        else:
+            self._levelbar_row(self.row_guest_mem, self.guest_mem_bar, None, None)
+            self._levelbar_row(
+                self.row_guest_swap, self.guest_swap_bar, None, None
+            )
+            self.row_squid.set_subtitle(
+                "unavailable" if status is not None else "—"
+            )
+
+        exists = bool(vm.get("exists"))
+        self.btn_start.set_sensitive(not busy and exists and not vm_running)
+        self.btn_stop.set_sensitive(not busy and vm_running)
+        self.btn_restart.set_sensitive(not busy and vm_running)
+
+        # Config group ---------------------------------------------------------
+        path = cfg.get("path")
+        self.row_cfg_file.set_subtitle(str(path or "—"))
+        if not cfg.get("exists"):
+            state, css = "missing", "error"
+        elif not cfg.get("valid"):
+            state, css = "invalid", "warning"
+        else:
+            state, css = "valid", "success"
+        self.cfg_state_label.set_label(state)
+        for cls in ("error", "warning", "success"):
+            self.cfg_state_label.remove_css_class(cls)
+        self.cfg_state_label.add_css_class(css)
+
+        self.row_password.set_subtitle(
+            {
+                "keyring": "GNOME keyring",
+                "config": "Config file (plaintext)",
+                "none": "Not stored",
+            }.get(cfg.get("password_source") or "", "—")
+        )
+        self.row_cert.set_subtitle(
+            str(cert.get("fingerprint") or "None saved")
+        )
+        self.row_refresh.set_subtitle(self._last_refresh)
+
+    @staticmethod
+    def _proxy_row(row, button, proxy):
+        if not proxy.get("enabled"):
+            row.set_subtitle("disabled")
+            button.set_sensitive(False)
+            return
+        state = "running" if proxy.get("running") else "stopped"
+        row.set_subtitle("127.0.0.1:%s — %s" % (proxy.get("port"), state))
+        button.set_sensitive(True)
+
+    @staticmethod
+    def _levelbar_row(row, bar, used, total):
+        if total:
+            row.set_subtitle("%s / %s" % (_fmt_size(used), _fmt_size(total)))
+            bar.set_min_value(0)
+            bar.set_max_value(float(total))
+            bar.set_value(float(used or 0))
+        else:
+            row.set_subtitle("unavailable")
+            bar.set_min_value(0)
+            bar.set_max_value(1)
+            bar.set_value(0)
+
+
+class LogSource(GObject.Object):
+    name = GObject.Property(type=str)
+    kind = GObject.Property(type=str)   # "file" | "guest"
+    ref = GObject.Property(type=str)    # file path or logs source name
+    enabled = GObject.Property(type=bool, default=True)
+
+    def __init__(self, name, kind, ref, enabled=True):
+        super().__init__(name=name, kind=kind, ref=ref, enabled=enabled)
+
+
+class LogsPage(Gtk.Box):
+    def __init__(self, win):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.win = win
+        self.set_margin_top(12)
+        self.set_margin_bottom(12)
+        self.set_margin_start(12)
+        self.set_margin_end(12)
+
+        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.model = Gio.ListStore(item_type=LogSource)
+        self.dropdown = Gtk.DropDown(model=self.model)
+        self.dropdown.set_hexpand(True)
+        factory = Gtk.SignalListItemFactory()
+        factory.connect("setup", self._factory_setup)
+        factory.connect("bind", self._factory_bind)
+        self.dropdown.set_factory(factory)
+        self.dropdown.connect("notify::selected", self._on_selected)
+        top.append(self.dropdown)
+
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic",
+                             tooltip_text="Refresh")
+        refresh.connect("clicked", lambda *_: self.reload())
+        top.append(refresh)
+        self.auto_btn = Gtk.ToggleButton(
+            icon_name="media-playlist-repeat-symbolic",
+            tooltip_text="Auto-refresh",
+        )
+        self.auto_btn.set_active(True)
+        self.auto_btn.connect("toggled", lambda *_: self._arm_auto())
+        top.append(self.auto_btn)
+        copy_btn = Gtk.Button(
+            icon_name="edit-copy-symbolic", tooltip_text="Copy all"
+        )
+        copy_btn.connect("clicked", self._copy_all)
+        top.append(copy_btn)
+        folder_btn = Gtk.Button(
+            icon_name="folder-open-symbolic", tooltip_text="Open folder"
+        )
+        folder_btn.connect("clicked", self._open_folder)
+        top.append(folder_btn)
+        self.append(top)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_vexpand(True)
+        scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.text_view = Gtk.TextView()
+        self.text_view.set_monospace(True)
+        self.text_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.text_view.set_editable(False)
+        self.text_view.set_cursor_visible(False)
+        self.buffer = self.text_view.get_buffer()
+        scrolled.set_child(self.text_view)
+        self.append(scrolled)
+
+        self._sources_sig = None
+        self._monitor = None
+        self._timer = 0
+        self._vm_dir = None
+
+    # -- source list -----------------------------------------------------------
+
+    @staticmethod
+    def _factory_setup(_factory, item):
+        label = Gtk.Label(xalign=0.0)
+        label.set_ellipsize(3)  # PANGO_ELLIPSIZE_END
+        item.set_child(label)
+
+    @staticmethod
+    def _factory_bind(_factory, item):
+        src = item.get_item()
+        label = item.get_child()
+        label.set_label(src.name)
+        label.set_sensitive(src.enabled)
+
+    def _build_sources(self, status):
+        st = status or {}
+        vm = st.get("vm") or {}
+        vm_running = vm.get("status") == "Running"
+        vm_dir = vm.get("dir") or ""
+        sources = [
+            LogSource("GUI activity", "file", vc.gui_log_path()),
+        ]
+        if vm_dir:
+            for label, fname in (
+                ("Lima host agent", "ha.stderr.log"),
+                ("Lima host agent (stdout)", "ha.stdout.log"),
+                ("Lima serial log", "serial.log"),
+                ("Lima serial log (verbose)", "serialv.log"),
+            ):
+                path = os.path.join(vm_dir, fname)
+                if os.path.exists(path):
+                    sources.append(LogSource(label, "file", path))
+        for label, ref in (
+            ("Guest journal", "journal"),
+            ("Squid", "squid"),
+            ("FortiClient", "forticlient"),
+        ):
+            sources.append(LogSource(label, "guest", ref, enabled=vm_running))
+        return sources
+
+    def update_status(self, status, _busy):
+        sources = self._build_sources(status)
+        sig = tuple((s.name, s.kind, s.ref, s.enabled) for s in sources)
+        if sig == self._sources_sig:
+            return
+        prev_ref = None
+        cur = self._current_source()
+        if cur is not None:
+            prev_ref = (cur.kind, cur.ref)
+        self._sources_sig = sig
+        self.model.remove_all()
+        selected = 0
+        for i, src in enumerate(sources):
+            self.model.append(src)
+            if (src.kind, src.ref) == prev_ref:
+                selected = i
+        self.dropdown.set_selected(selected)
+        # set_selected does not emit notify::selected if index unchanged
+        self._on_selected()
+
+    def _current_source(self):
+        idx = self.dropdown.get_selected()
+        if idx == Gtk.INVALID_LIST_POSITION:
+            return None
+        return self.model.get_item(idx)
+
+    def _on_selected(self, *_args):
+        self._arm_auto()
+        self.reload()
+
+    # -- loading --------------------------------------------------------------
+
+    def _set_text(self, text):
+        self.buffer.set_text(text)
+        GLib.idle_add(self._scroll_to_end)
+
+    def _scroll_to_end(self):
+        end = self.buffer.get_end_iter()
+        self.text_view.scroll_to_iter(end, 0.0, True, 0.0, 1.0)
+        return GLib.SOURCE_REMOVE
+
+    def reload(self):
+        src = self._current_source()
+        if src is None:
+            return
+        if src.kind == "guest":
+            if not src.enabled:
+                self._set_text("VM is not running.\n")
+                return
+            self._set_text("Loading %s…\n" % src.name)
+
+            def done(rc, stdout, stderr):
+                if self._current_source() is not src:
+                    return
+                if rc == vc.EXIT_OK:
+                    self._set_text(stdout or "(no output)\n")
+                else:
+                    detail = _last_line(stderr) or _last_line(stdout)
+                    vc.log_line(
+                        "logs %s failed (exit %s): %s"
+                        % (src.ref, rc, detail or "no output")
+                    )
+                    self._set_text(
+                        "logs %s failed (exit %s):\n%s"
+                        % (src.ref, rc, stderr or stdout)
+                    )
+
+            vc.run_cli(
+                ["logs", src.ref, "-n", str(LOG_MAX_LINES)], done, log=False
+            )
+        else:
+            self._load_file_tail(src.ref)
+
+    def _load_file_tail(self, path):
+        gfile = Gio.File.new_for_path(path)
+
+        def on_info(f, res):
+            try:
+                info = f.query_info_finish(res)
+                size = info.get_size()
+            except GLib.Error as exc:
+                self._set_text("Cannot read %s:\n%s\n" % (path, exc.message))
+                return
+            f.read_async(
+                GLib.PRIORITY_DEFAULT,
+                None,
+                lambda f2, r2: self._on_stream(f2, r2, path, size),
+            )
+
+        gfile.query_info_async(
+            "standard::size",
+            Gio.FileQueryInfoFlags.NONE,
+            GLib.PRIORITY_DEFAULT,
+            None,
+            on_info,
+        )
+
+    def _on_stream(self, gfile, res, path, size):
+        try:
+            stream = gfile.read_finish(res)
+        except GLib.Error as exc:
+            self._set_text("Cannot read %s:\n%s\n" % (path, exc.message))
+            return
+        start = max(0, size - FILE_TAIL_BYTES)
+        if start:
+            stream.seek(start, GLib.SeekType.SET, None)
+        chunks = []
+
+        def read_more():
+            stream.read_bytes_async(
+                65536, GLib.PRIORITY_DEFAULT, None, on_chunk
+            )
+
+        def on_chunk(s, r):
+            try:
+                data = s.read_bytes_finish(r).get_data()
+            except GLib.Error:
+                data = None
+            if data:
+                chunks.append(data)
+                read_more()
+                return
+            text = b"".join(chunks).decode("utf-8", "replace")
+            lines = text.splitlines()[-LOG_MAX_LINES:]
+            out = "\n".join(lines)
+            if start:
+                out = "… (last %d lines)\n%s" % (len(lines), out)
+            self._set_text(out + "\n")
+            stream.close(None)
+
+        read_more()
+
+    # -- auto refresh ----------------------------------------------------------
+
+    def _disarm_auto(self):
+        if self._monitor is not None:
+            self._monitor.cancel()
+            self._monitor = None
+        if self._timer:
+            GLib.source_remove(self._timer)
+            self._timer = 0
+
+    def _arm_auto(self):
+        self._disarm_auto()
+        if not self.auto_btn.get_active():
+            return
+        src = self._current_source()
+        if src is None:
+            return
+        if src.kind == "file":
+            try:
+                gfile = Gio.File.new_for_path(src.ref)
+                self._monitor = gfile.monitor_file(
+                    Gio.FileMonitorFlags.NONE, None
+                )
+                self._monitor.connect("changed", lambda *_: self.reload())
+            except GLib.Error:
+                self._timer = GLib.timeout_add_seconds(
+                    FILE_WATCH_SECONDS, self._auto_tick
+                )
+        else:
+            self._timer = GLib.timeout_add_seconds(
+                GUEST_LOG_SECONDS, self._auto_tick
+            )
+
+    def _auto_tick(self):
+        src = self._current_source()
+        if src is not None and (src.kind == "file" or src.enabled):
+            self.reload()
+        return GLib.SOURCE_CONTINUE
+
+    # -- actions -----------------------------------------------------------------
+
+    def _copy_all(self, *_args):
+        text = self.buffer.get_text(
+            self.buffer.get_start_iter(), self.buffer.get_end_iter(), False
+        )
+        self.get_clipboard().set_text(text)
+        self.win.toast("Log copied to clipboard")
+
+    def _open_folder(self, *_args):
+        src = self._current_source()
+        target = None
+        if src is not None:
+            if src.kind == "file":
+                target = os.path.dirname(src.ref)
+            else:
+                vm = (self.win.status or {}).get("vm") or {}
+                target = vm.get("dir")
+        if not target:
+            return
+        launcher = Gtk.FileLauncher.new(Gio.File.new_for_path(target))
+        launcher.launch(self.get_root(), None, None)
+
+
+class SettingsPage(Gtk.Box):
+    def __init__(self, win):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self.win = win
+        self.path = None
+        self.cfg = None
+        self._dirty = False
+        self._filling = False
+
+        page = Adw.PreferencesPage()
+        page.set_vexpand(True)
+
+        # Connection ----------------------------------------------------------
+        conn = Adw.PreferencesGroup(title="Connection")
+        self.gw_row = Adw.EntryRow(title="Gateway")
+        self.port_row = Adw.SpinRow(
+            title="Port",
+            adjustment=Gtk.Adjustment(
+                value=443, lower=1, upper=65535,
+                step_increment=1, page_increment=10,
+            ),
+            digits=0,
+        )
+        self.user_row = Adw.EntryRow(title="Username")
+        conn.add(self.gw_row)
+        conn.add(self.port_row)
+        conn.add(self.user_row)
+        page.add(conn)
+
+        # Password -------------------------------------------------------------
+        pw_group = Adw.PreferencesGroup(title="Password")
+        self.pw_source_row = Adw.ActionRow(title="Stored in")
+        pw_group.add(self.pw_source_row)
+        self.pw_entry = Adw.PasswordEntryRow(title="New password")
+        pw_group.add(self.pw_entry)
+        self.pw_save = Adw.ActionRow(title="Save to keyring")
+        pw_save_btn = Gtk.Button(label="Save", valign=Gtk.Align.CENTER)
+        pw_save_btn.connect("clicked", self._on_pw_save)
+        self.pw_save.add_suffix(pw_save_btn)
+        pw_group.add(self.pw_save)
+        self.pw_remove = Adw.ActionRow(title="Remove from keyring")
+        pw_remove_btn = Gtk.Button(label="Remove", valign=Gtk.Align.CENTER)
+        pw_remove_btn.connect("clicked", self._on_pw_remove)
+        self.pw_remove.add_suffix(pw_remove_btn)
+        pw_group.add(self.pw_remove)
+        self.pw_move = Adw.ActionRow(title="Move to keyring")
+        pw_move_btn = Gtk.Button(label="Move", valign=Gtk.Align.CENTER)
+        pw_move_btn.connect("clicked", self._on_pw_move)
+        self.pw_move.add_suffix(pw_move_btn)
+        pw_group.add(self.pw_move)
+        page.add(pw_group)
+
+        # Proxies ----------------------------------------------------------------
+        proxy_group = Adw.PreferencesGroup(title="Proxies")
+        self.socks_enabled = Adw.SwitchRow(title="SOCKS proxy")
+        self.socks_port = Adw.SpinRow(
+            title="Port",
+            adjustment=Gtk.Adjustment(
+                value=1080, lower=1, upper=65535,
+                step_increment=1, page_increment=10,
+            ),
+            digits=0,
+        )
+        self.socks_auto_start = Adw.SwitchRow(title="Start with VPN")
+        self.socks_auto_stop = Adw.SwitchRow(title="Stop with VPN")
+        proxy_group.add(self.socks_enabled)
+        proxy_group.add(self.socks_port)
+        proxy_group.add(self.socks_auto_start)
+        proxy_group.add(self.socks_auto_stop)
+
+        self.http_enabled = Adw.SwitchRow(title="HTTP proxy")
+        self.http_port = Adw.SpinRow(
+            title="Port",
+            subtitle="Fixed at 3128 by the VM's Squid configuration",
+            adjustment=Gtk.Adjustment(
+                value=3128, lower=1, upper=65535,
+                step_increment=1, page_increment=10,
+            ),
+            digits=0,
+        )
+        self.http_port.set_sensitive(False)
+        self.http_auto_start = Adw.SwitchRow(title="Start with VPN")
+        self.http_auto_stop = Adw.SwitchRow(title="Stop with VPN")
+        proxy_group.add(self.http_enabled)
+        proxy_group.add(self.http_port)
+        proxy_group.add(self.http_auto_start)
+        proxy_group.add(self.http_auto_stop)
+        page.add(proxy_group)
+
+        # Certificate --------------------------------------------------------------
+        cert_group = Adw.PreferencesGroup(title="Certificate")
+        self.cert_row = Adw.ActionRow(title="Saved fingerprint")
+        cert_group.add(self.cert_row)
+        self.cert_forget = Adw.ActionRow(title="Forget saved fingerprint")
+        cert_forget_btn = Gtk.Button(
+            label="Forget", valign=Gtk.Align.CENTER
+        )
+        cert_forget_btn.add_css_class("destructive-action")
+        cert_forget_btn.connect("clicked", self._on_cert_forget)
+        self.cert_forget.add_suffix(cert_forget_btn)
+        cert_group.add(self.cert_forget)
+        page.add(cert_group)
+
+        # Startup ------------------------------------------------------------------
+        start_group = Adw.PreferencesGroup(title="Startup")
+        self.startup_row = Adw.SwitchRow(title="Start tray icon at login")
+        self.startup_row.set_active(vc.autostart_enabled())
+        self.startup_row.connect("notify::active", self._on_startup_toggled)
+        start_group.add(self.startup_row)
+        page.add(start_group)
+
+        # Virtual machine ---------------------------------------------------------
+        vm_group = Adw.PreferencesGroup(title="Virtual machine")
+        self.delete_row = Adw.ActionRow(title="Delete VM")
+        delete_btn = Gtk.Button(label="Delete", valign=Gtk.Align.CENTER)
+        delete_btn.add_css_class("destructive-action")
+        delete_btn.connect("clicked", self._on_delete_vm)
+        self.delete_row.add_suffix(delete_btn)
+        vm_group.add(self.delete_row)
+        page.add(vm_group)
+
+        self.append(page)
+
+        # Apply / Revert ---------------------------------------------------------
+        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        bottom.set_margin_top(8)
+        bottom.set_margin_bottom(12)
+        bottom.set_margin_start(16)
+        bottom.set_margin_end(16)
+        bottom.set_halign(Gtk.Align.END)
+        self.revert_btn = Gtk.Button(label="Revert")
+        self.revert_btn.connect("clicked", self._on_revert)
+        self.apply_btn = Gtk.Button(label="Apply")
+        self.apply_btn.add_css_class("suggested-action")
+        self.apply_btn.connect("clicked", self._on_apply)
+        bottom.append(self.revert_btn)
+        bottom.append(self.apply_btn)
+        self.append(bottom)
+
+        for row in (self.gw_row, self.user_row):
+            row.connect("changed", self._mark_dirty)
+        for row in (
+            self.port_row,
+            self.socks_port,
+            self.http_port,
+        ):
+            row.connect("notify::value", self._mark_dirty)
+        for row in (
+            self.socks_enabled,
+            self.socks_auto_start,
+            self.socks_auto_stop,
+            self.http_enabled,
+            self.http_auto_start,
+            self.http_auto_stop,
+        ):
+            row.connect("notify::active", self._mark_dirty)
+
+        self._update_buttons()
+
+    # -- load/save ---------------------------------------------------------------
+
+    def _resolve_path(self, status):
+        cfg = ((status or {}).get("config") or {})
+        if cfg.get("path"):
+            return cfg["path"]
+        env_path = os.environ.get("VPN_CONFIG")
+        if env_path:
+            return env_path
+        cli = vc.find_cli()
+        if cli:
+            return os.path.join(os.path.dirname(cli), "vpn-config.json")
+        return os.path.join(SCRIPT_DIR, "..", "vpn-config.json")
+
+    def update_status(self, status, _busy):
+        if self.cfg is None:
+            self.load(self._resolve_path(status))
+        cfg = (status or {}).get("config") or {}
+        source = cfg.get("password_source") or "none"
+        labels = {
+            "keyring": "Keyring",
+            "config": "Config file (plaintext)",
+            "none": "Not stored",
+        }
+        self.pw_source_row.set_subtitle(labels.get(source, source))
+        for cls in ("warning",):
+            self.pw_source_row.remove_css_class(cls)
+        if source == "config":
+            self.pw_source_row.add_css_class("warning")
+        self.pw_move.set_visible(source == "config")
+        fp = ((status or {}).get("cert") or {}).get("fingerprint")
+        self.cert_row.set_subtitle(str(fp) if fp else "None saved")
+
+    def load(self, path):
+        self.path = path
+        self.cfg = vc.load_config(path)
+        self._fill()
+
+    def _fill(self):
+        self._filling = True
+        cfg = self.cfg or {}
+        self.gw_row.set_text(str(cfg.get("gateway") or ""))
+        self.port_row.set_value(float(cfg.get("port") or 443))
+        self.user_row.set_text(str(cfg.get("username") or ""))
+        socks = cfg.get("socks_proxy") or {}
+        http = cfg.get("http_proxy") or {}
+        self.socks_enabled.set_active(bool(socks.get("enabled", True)))
+        self.socks_port.set_value(float(socks.get("port") or 1080))
+        self.socks_auto_start.set_active(bool(socks.get("auto_start", True)))
+        self.socks_auto_stop.set_active(bool(socks.get("auto_stop", True)))
+        self.http_enabled.set_active(bool(http.get("enabled", False)))
+        self.http_port.set_value(float(http.get("port") or 3128))
+        self.http_auto_start.set_active(bool(http.get("auto_start", False)))
+        self.http_auto_stop.set_active(bool(http.get("auto_stop", False)))
+        self._filling = False
+        self._dirty = False
+        self._update_buttons()
+
+    def _collect(self):
+        cfg = self.cfg
+        cfg["gateway"] = self.gw_row.get_text().strip()
+        cfg["port"] = int(self.port_row.get_value())
+        cfg["username"] = self.user_row.get_text().strip()
+        socks = cfg.setdefault("socks_proxy", {})
+        socks["enabled"] = self.socks_enabled.get_active()
+        socks["port"] = int(self.socks_port.get_value())
+        socks["auto_start"] = self.socks_auto_start.get_active()
+        socks["auto_stop"] = self.socks_auto_stop.get_active()
+        http = cfg.setdefault("http_proxy", {})
+        http["enabled"] = self.http_enabled.get_active()
+        http["port"] = int(self.http_port.get_value())
+        http["auto_start"] = self.http_auto_start.get_active()
+        http["auto_stop"] = self.http_auto_stop.get_active()
+
+    def _mark_dirty(self, *_args):
+        if self._filling:
+            return
+        self._dirty = True
+        self._update_buttons()
+
+    def _update_buttons(self):
+        self.apply_btn.set_sensitive(self._dirty)
+        self.revert_btn.set_sensitive(self._dirty)
+
+    def _on_apply(self, *_args):
+        if not self.gw_row.get_text().strip() or not self.user_row.get_text().strip():
+            self.win.toast("Gateway and username must not be empty")
+            return
+        self._collect()
+        try:
+            vc.save_config(self.path, self.cfg)
+        except OSError as exc:
+            self.win.toast("Saving failed: %s" % exc)
+            return
+        self._dirty = False
+        self._update_buttons()
+        self.win.toast("Settings saved")
+        self.win.refresh_now()
+
+    def _on_revert(self, *_args):
+        self.load(self.path)
+        self.win.toast("Settings reverted")
+
+    # -- password actions ----------------------------------------------------------
+
+    def _on_pw_save(self, *_args):
+        password = self.pw_entry.get_text()
+        if not password:
+            self.win.toast("Enter a password first")
+            return
+
+        def done(rc, _out, err):
+            if rc == vc.EXIT_OK:
+                self.pw_entry.set_text("")
+                self.win.toast("Password saved to keyring")
+                self.win.refresh_now()
+            else:
+                self.win.toast(
+                    "Saving failed: %s" % (_last_line(err) or "exit %s" % rc)
+                )
+
+        vc.run_cli(
+            ["password-set", "--stdin"], done, stdin_text=password + "\n"
+        )
+
+    def _on_pw_remove(self, *_args):
+        def done(rc, _out, err):
+            if rc == vc.EXIT_OK:
+                self.win.toast("Password removed from keyring")
+                self.win.refresh_now()
+            else:
+                self.win.toast(
+                    "Removal failed: %s" % (_last_line(err) or "exit %s" % rc)
+                )
+
+        vc.run_cli(["password-clear"], done)
+
+    def _on_pw_move(self, *_args):
+        password = (self.cfg or {}).get("password")
+        if not password:
+            self.win.toast("No plaintext password in the config")
+            return
+
+        def done(rc, _out, err):
+            if rc != vc.EXIT_OK:
+                self.win.toast(
+                    "Keyring save failed: %s"
+                    % (_last_line(err) or "exit %s" % rc)
+                )
+                return
+            self.cfg.pop("password", None)
+            try:
+                vc.save_config(self.path, self.cfg)
+            except OSError as exc:
+                self.win.toast("Saving config failed: %s" % exc)
+                return
+            self.win.toast("Password moved to keyring")
+            self.win.refresh_now()
+
+        vc.run_cli(
+            ["password-set", "--stdin"], done, stdin_text=password + "\n"
+        )
+
+    # -- certificate -----------------------------------------------------------------
+
+    def _on_cert_forget(self, *_args):
+        dialog = Adw.AlertDialog(
+            heading="Forget saved fingerprint?",
+            body="The next connection will ask to trust the server "
+            "certificate again.",
+        )
+        dialog.add_response("cancel", "_Cancel")
+        dialog.add_response("forget", "_Forget")
+        dialog.set_response_appearance(
+            "forget", Adw.ResponseAppearance.DESTRUCTIVE
+        )
+        dialog.set_close_response("cancel")
+
+        def on_response(_dlg, response):
+            if response != "forget":
+                return
+
+            def done(rc, out, err):
+                if rc == vc.EXIT_OK:
+                    self.win.toast(_last_line(out) or "Fingerprint forgotten")
+                    self.win.refresh_now()
+                else:
+                    self.win.toast(
+                        "Failed: %s" % (_last_line(err) or "exit %s" % rc)
+                    )
+
+            vc.run_cli(["cert-forget"], done)
+
+        dialog.connect("response", on_response)
+        dialog.present(self.get_root())
+
+    # -- startup -----------------------------------------------------------------------
+
+    def _on_startup_toggled(self, row, _param):
+        if self._filling:
+            return
+        try:
+            vc.set_autostart(row.get_active(), TRAY_PATH)
+        except OSError as exc:
+            self.win.toast("Autostart failed: %s" % exc)
+
+    # -- delete -----------------------------------------------------------------------
+
+    def _on_delete_vm(self, *_args):
+        vm_name = ((self.win.status or {}).get("vm") or {}).get("name") or ""
+        dialog = Adw.AlertDialog(
+            heading="Delete the virtual machine?",
+            body="This permanently removes the VM '%s' and its disk image. "
+            "This cannot be undone." % vm_name,
+        )
+        dialog.add_response("cancel", "_Cancel")
+        dialog.add_response("delete", "_Delete")
+        dialog.set_response_appearance(
+            "delete", Adw.ResponseAppearance.DESTRUCTIVE
+        )
+        dialog.set_close_response("cancel")
+
+        def on_response(_dlg, response):
+            if response == "delete":
+                self.win.run_action("Delete VM", ["delete", "-y"])
+
+        dialog.connect("response", on_response)
+        dialog.present(self.get_root())
+
+
+class MainWindow(Adw.ApplicationWindow):
+    def __init__(self, application):
+        super().__init__(
+            application=application,
+            title="VM VPN",
+            default_width=720,
+            default_height=640,
+        )
+        self.status = None
+        self.action_running = False
+        self.action = None
+        self.flow = None
+        self.poll_in_flight = False
+        self.last_failed = False
+        self._poll_log = vc.StatusPollLogger()
+        self._last_refresh = "—"
+
+        self.stack = Adw.ViewStack()
+        self.status_page = StatusPage(self)
+        self.logs_page = LogsPage(self)
+        self.settings_page = SettingsPage(self)
+        self.stack.add_titled_with_icon(
+            self.status_page, "status", "Status", "computer-symbolic"
+        )
+        self.stack.add_titled_with_icon(
+            self.logs_page, "logs", "Logs", "text-x-generic-symbolic"
+        )
+        self.stack.add_titled_with_icon(
+            self.settings_page, "settings", "Settings",
+            "emblem-system-symbolic",
+        )
+
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        switcher = Adw.ViewSwitcher(
+            stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE
+        )
+        header.set_title_widget(switcher)
+        menu_button = Gtk.MenuButton(icon_name="open-menu-symbolic")
+        menu = Gio.Menu()
+        menu.append("Refresh", "win.refresh")
+        menu.append("About", "app.about")
+        menu.append("Quit", "app.quit")
+        menu_button.set_menu_model(menu)
+        header.pack_end(menu_button)
+        toolbar.add_top_bar(header)
+
+        self.toast_overlay = Adw.ToastOverlay()
+        self.toast_overlay.set_child(self.stack)
+        toolbar.set_content(self.toast_overlay)
+        self.set_content(toolbar)
+
+        refresh_action = Gio.SimpleAction.new("refresh", None)
+        refresh_action.connect("activate", lambda *_: self.refresh_now())
+        self.add_action(refresh_action)
+
+        self.connect("map", lambda *_: self._poll())
+        GLib.timeout_add_seconds(POLL_SECONDS, self._poll_tick)
+        self._apply_status()
+
+    # -- helpers ------------------------------------------------------------------
+
+    def toast(self, message):
+        self.toast_overlay.add_toast(Adw.Toast.new(message))
+
+    def refresh_now(self):
+        self._poll()
+
+    def _busy(self):
+        return self.action_running or bool(
+            (self.status or {}).get("busy")
+        )
+
+    def _cfg(self):
+        return (self.status or {}).get("config") or {}
+
+    # -- polling ---------------------------------------------------------------------
+
+    def _poll_tick(self):
+        if self.get_mapped():
+            self._poll()
+        return GLib.SOURCE_CONTINUE
+
+    def _poll(self):
+        if self.poll_in_flight:
+            return
+        self.poll_in_flight = True
+        vc.run_cli(["status", "--json"], self._on_polled, log=False)
+
+    def _on_polled(self, rc, stdout, stderr):
+        self.poll_in_flight = False
+        parsed = vc.parse_status(stdout) if rc == vc.EXIT_OK else None
+        self._poll_log.report(parsed is not None, stderr)
+        if parsed is not None:
+            self.status = parsed
+            self._last_refresh = time.strftime("%H:%M:%S")
+        self._apply_status()
+
+    def _apply_status(self):
+        busy = self._busy()
+        self.status_page._last_refresh = self._last_refresh
+        self.status_page.update(
+            self.status, busy, self.action, self.last_failed
+        )
+        self.logs_page.update_status(self.status, busy)
+        self.settings_page.update_status(self.status, busy)
+
+    # -- actions -----------------------------------------------------------------------
+
+    def run_action(self, label, args):
+        if self._busy():
+            return
+        self.action_running = True
+        self.action = label
+        self._apply_status()
+
+        def done(rc, stdout, stderr):
+            self.action_running = False
+            self.action = None
+            if rc == vc.EXIT_BUSY:
+                self.toast("Another vmvpn operation is in progress")
+            elif rc == vc.EXIT_OK:
+                self.last_failed = False
+                self.toast("%s: done" % label)
+            else:
+                self.last_failed = True
+                detail = _last_line(stderr) or _last_line(stdout)
+                self.toast(
+                    "%s failed: %s" % (label, detail or "exit %s" % rc)
+                )
+            self._apply_status()
+            self._poll()
+
+        vc.run_cli(args, done)
+
+    def _on_connect_clicked(self, *_args):
+        if self._busy():
+            return
+        if ((self.status or {}).get("vpn") or {}).get("state") == "connected":
+            self.run_action("Disconnect", ["vpn-disconnect"])
+            return
+        self.action_running = True
+        self.action = "connect"
+        self._apply_status()
+        self.flow = vc.ConnectFlow(
+            self._ask_password, self._ask_trust, self._connect_done
+        )
+        self.flow.start()
+
+    def _connect_done(self, rc, stdout, stderr):
+        self.flow = None
+        self.action_running = False
+        self.action = None
+        if rc == vc.EXIT_OK:
+            self.last_failed = False
+            self.toast("VPN connected")
+        elif rc == vc.EXIT_BUSY:
+            self.toast("Another vmvpn operation is in progress")
+        elif rc != vc.EXIT_PASSWORD_REQUIRED:
+            self.last_failed = True
+            detail = _last_line(stderr) or _last_line(stdout)
+            self.toast("Connect failed: %s" % (detail or "exit %s" % rc))
+        self._apply_status()
+        self._poll()
+
+    def _on_firefox(self, *_args):
+        self.run_action("Launch Firefox", ["firefox"])
+
+    def _copy_proxy(self, kind):
+        proxy = ((self.status or {}).get("proxies") or {}).get(kind) or {}
+        port = proxy.get("port")
+        if not port:
+            return
+        url = (
+            "socks5h://127.0.0.1:%s" if kind == "socks" else "http://127.0.0.1:%s"
+        ) % port
+        self.get_clipboard().set_text(url)
+        self.toast("Copied %s" % url)
+
+    # -- connect dialogs --------------------------------------------------------------
+
+    def _ask_password(self, error_message, cb):
+        cfg = self._cfg()
+        username = cfg.get("username")
+        gateway = cfg.get("gateway")
+        if username and gateway:
+            body = "VPN password for %s@%s" % (username, gateway)
+        else:
+            body = "Enter the VPN password"
+
+        dialog = Adw.AlertDialog(heading="VPN password", body=body)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        if error_message:
+            err = Gtk.Label(label=error_message, xalign=0.0)
+            err.add_css_class("error")
+            err.set_wrap(True)
+            box.append(err)
+        group = Adw.PreferencesGroup()
+        entry = Adw.PasswordEntryRow(title="Password")
+        group.add(entry)
+        box.append(group)
+        remember = Gtk.CheckButton(label="Remember in GNOME keyring")
+        box.append(remember)
+        dialog.set_extra_child(box)
+        dialog.add_response("cancel", "_Cancel")
+        dialog.add_response("connect", "_Connect")
+        dialog.set_response_appearance(
+            "connect", Adw.ResponseAppearance.SUGGESTED
+        )
+        dialog.set_default_response("connect")
+        dialog.set_close_response("cancel")
+
+        def on_response(_dlg, response):
+            if response == "connect":
+                password = entry.get_text()
+                cb(password if password else None, remember.get_active())
+            else:
+                cb(None, False)
+
+        dialog.connect("response", on_response)
+        dialog.present(self)
+        return dialog
+
+    def _ask_trust(self, new_fp, saved_fp, cb):
+        if saved_fp:
+            heading = "VPN server certificate has changed"
+            body = (
+                "Saved fingerprint:\n<tt>%s</tt>\n\nNew fingerprint:\n"
+                "<tt>%s</tt>\n\nThis could indicate a man-in-the-middle "
+                "attack or a legitimate certificate update.\n"
+                "Trust the new certificate?"
+                % (_escape(saved_fp), _escape(new_fp))
+            )
+            appearance = Adw.ResponseAppearance.DESTRUCTIVE
+        else:
+            heading = "New VPN server certificate"
+            body = (
+                "Fingerprint (SHA1):\n<tt>%s</tt>\n\n"
+                "Trust this certificate and save the fingerprint?"
+                % _escape(new_fp)
+            )
+            appearance = Adw.ResponseAppearance.SUGGESTED
+
+        dialog = Adw.AlertDialog(heading=heading)
+        dialog.set_body_use_markup(True)
+        dialog.set_body(body)
+        dialog.add_response("cancel", "_Cancel")
+        dialog.add_response("trust", "_Trust")
+        dialog.set_response_appearance("trust", appearance)
+        dialog.set_close_response("cancel")
+        dialog.connect("response", lambda _d, r: cb(r == "trust"))
+        dialog.present(self)
+        return dialog
+
+
+class VmVpnApp(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="io.github.carrerfe.VmVpn")
+        self.connect("activate", self._on_activate)
+
+        about = Gio.SimpleAction.new("about", None)
+        about.connect("activate", self._on_about)
+        self.add_action(about)
+        quit_action = Gio.SimpleAction.new("quit", None)
+        quit_action.connect("activate", lambda *_: self.quit())
+        self.add_action(quit_action)
+
+    def _on_activate(self, app):
+        win = self.props.active_window
+        if win is None:
+            win = MainWindow(application=self)
+        win.present()
+
+    def _on_about(self, *_args):
+        win = self.props.active_window
+        cli_version = "unknown"
+        if win is not None:
+            cli_version = (win.status or {}).get("version") or "unknown"
+        debug_info = "CLI: %s\nCLI path: %s" % (
+            cli_version,
+            vc.find_cli() or "not found",
+        )
+        about = Adw.AboutWindow(
+            transient_for=win,
+            application_name="VM VPN",
+            application_icon="network-vpn",
+            version=vc.VERSION,
+            debug_info=debug_info,
+            comments=(
+                "Control window for the Lima-based FortiClient VPN "
+                "virtual machine."
+            ),
+        )
+        about.present()
+
+
+def main():
+    if any(a in ("--version", "-V") for a in sys.argv[1:]):
+        print("vmvpn-window %s" % vc.VERSION)
+        return 0
+    app = VmVpnApp()
+    return app.run([sys.argv[0]])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

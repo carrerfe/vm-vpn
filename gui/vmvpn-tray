@@ -1,0 +1,645 @@
+#!/usr/bin/env python3
+"""vmvpn tray icon - GTK3 + AyatanaAppIndicator3 (SNI, works on GNOME/KDE)."""
+
+import os
+import signal
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("AyatanaAppIndicator3", "0.1")
+from gi.repository import AyatanaAppIndicator3 as AppIndicator
+from gi.repository import Gdk, Gio, GLib, Gtk
+
+import vmvpn_common as vc
+
+try:
+    gi.require_version("Notify", "0.7")
+    from gi.repository import Notify
+
+    _NOTIFY_OK = bool(Notify.init("VM VPN"))
+except (ImportError, ValueError):
+    _NOTIFY_OK = False
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+POLL_INTERVAL_SECONDS = 10
+
+ICON_CONNECTED = "network-vpn-symbolic"
+ICON_ACQUIRING = "network-vpn-acquiring-symbolic"
+ICON_DISCONNECTED = "network-vpn-disconnected-symbolic"
+ICON_DISABLED = "network-vpn-disabled-symbolic"
+ICON_NO_ROUTE = "network-vpn-no-route-symbolic"
+ICON_FALLBACK = "network-vpn"
+
+
+class TrayApp:
+    def __init__(self):
+        self.app = Gtk.Application(
+            application_id="io.github.carrerfe.VmVpn.Tray",
+            flags=Gio.ApplicationFlags.FLAGS_NONE,
+        )
+        self.app.connect("startup", self._on_startup)
+        self.app.connect("activate", self._on_activate)
+        self.app.connect("shutdown", self._on_shutdown)
+
+        self.status = None            # latest parsed `status --json` or None
+        self.action = None            # None | "connect" | other action label
+        self.action_running = False
+        self.flow = None
+        self.last_failed = False
+        self.poll_in_flight = False
+        self.user_action_pending = False  # suppress "connection lost" once
+        self.indicator = None
+        self.menu = None
+        self._dialogs = []
+        self._menu_sig = None         # last built menu signature
+        self._icon = None             # last icon name set on the indicator
+        self._poll_log = vc.StatusPollLogger()
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def _on_startup(self, app):
+        self.indicator = AppIndicator.Indicator.new(
+            "vmvpn",
+            ICON_DISABLED,
+            AppIndicator.IndicatorCategory.APPLICATION_STATUS,
+        )
+        self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        self.indicator.set_title("VM VPN")
+        app.hold()
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, self._quit)
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, self._quit)
+        self._refresh_ui()
+        self._poll()
+        GLib.timeout_add_seconds(POLL_INTERVAL_SECONDS, self._poll)
+
+    def _on_activate(self, app):
+        # Second-instance activation or explicit activation: refresh now.
+        self._poll()
+
+    def _on_shutdown(self, app):
+        if self.flow is not None:
+            self.flow.cancel()
+        for dlg in self._dialogs:
+            dlg.destroy()
+
+    def _quit(self, *_args):
+        self.app.quit()
+        return GLib.SOURCE_REMOVE
+
+    # -- status accessors ----------------------------------------------------
+
+    def _vm(self):
+        return (self.status or {}).get("vm") or {}
+
+    def _vpn(self):
+        return (self.status or {}).get("vpn") or {}
+
+    def _cfg(self):
+        return (self.status or {}).get("config") or {}
+
+    def _proxies(self):
+        return (self.status or {}).get("proxies") or {}
+
+    def _vm_running(self):
+        return self._vm().get("status") == "Running"
+
+    def _connected(self):
+        return self._vpn().get("state") == "connected"
+
+    def _config_valid(self):
+        cfg = self._cfg()
+        return bool(cfg.get("exists") and cfg.get("valid"))
+
+    def _status_busy(self):
+        """True when another vmvpn process holds the operation lock."""
+        return bool((self.status or {}).get("busy"))
+
+    def _busy(self):
+        """True while our own action or another process's operation runs."""
+        return self.action_running or self._status_busy()
+
+    # -- polling -------------------------------------------------------------
+
+    def _poll(self, *_args):
+        if self.poll_in_flight:
+            return GLib.SOURCE_CONTINUE
+        self.poll_in_flight = True
+        vc.run_cli(["status", "--json"], self._on_polled, log=False)
+        return GLib.SOURCE_CONTINUE
+
+    def _on_polled(self, rc, stdout, stderr):
+        self.poll_in_flight = False
+        prev_status = self.status
+        prev_vpn_state = self._vpn().get("state")
+        prev_busy = bool((prev_status or {}).get("busy"))
+        self.status = vc.parse_status(stdout) if rc == vc.EXIT_OK else None
+        new_busy = self._status_busy()
+        self._poll_log.report(self.status is not None, stderr)
+
+        if self.action_running:
+            return  # keep the data, but don't disturb the busy UI
+
+        new_vpn_state = self._vpn().get("state")
+        if (
+            prev_vpn_state == "connected"
+            and new_vpn_state == "disconnected"
+            and not self.user_action_pending
+            and not prev_busy
+            and not new_busy
+        ):
+            self._notify(
+                "VPN connection lost",
+                "The VPN connection dropped.",
+                ICON_DISCONNECTED,
+            )
+        self.user_action_pending = False
+        self._refresh_ui()
+
+    # -- UI ------------------------------------------------------------------
+
+    def _icon_name(self):
+        if self._busy():
+            name = ICON_ACQUIRING
+        elif self.last_failed or self.status is None:
+            name = ICON_NO_ROUTE
+        elif self._connected():
+            name = ICON_CONNECTED
+        elif self._config_valid() and self._vm_running():
+            name = ICON_DISCONNECTED
+        else:
+            name = ICON_DISABLED
+        if not Gtk.IconTheme.get_default().has_icon(name):
+            name = ICON_FALLBACK
+        return name
+
+    def _header_text(self):
+        if self.action == "connect":
+            return "Connecting…"
+        if self._busy():
+            return "Working…"
+        if self.status is None:
+            return "Status unavailable"
+        if not self._config_valid():
+            return "Not configured"
+        if not self._vm().get("exists"):
+            return "VM not created"
+        if not self._vm_running():
+            return "VM stopped"
+        if self._connected():
+            gateway = self._cfg().get("gateway")
+            if gateway:
+                return "VPN: Connected — %s" % gateway
+            return "VPN: Connected"
+        return "VPN: Disconnected"
+
+    def _refresh_ui(self):
+        icon = self._icon_name()
+        if icon != self._icon:
+            self._icon = icon
+            self.indicator.set_icon_full(icon, "VM VPN")
+        self._rebuild_menu()
+
+    @staticmethod
+    def _sep():
+        item = Gtk.SeparatorMenuItem()
+        item.show()
+        return item
+
+    def _menu_signature(self):
+        """Tuple describing the menu model; rebuild only when it changes."""
+        busy = self._busy()
+        connected = self._connected()
+        proxies = self._proxies()
+        socks = proxies.get("socks") or {}
+        http = proxies.get("http") or {}
+
+        proxy_line = None
+        if connected:
+            parts = []
+            if socks.get("enabled") and socks.get("running"):
+                parts.append("SOCKS 127.0.0.1:%s" % socks.get("port"))
+            if http.get("enabled") and http.get("running"):
+                parts.append("HTTP 127.0.0.1:%s" % http.get("port"))
+            if parts:
+                proxy_line = " · ".join(parts)
+
+        window_bin = os.path.join(SCRIPT_DIR, "vmvpn-window")
+        window_visible = os.path.isfile(window_bin) and os.access(
+            window_bin, os.X_OK
+        )
+
+        return (
+            self._header_text(),
+            proxy_line,
+            "Disconnect" if connected else "Connect",
+            not busy and (connected or self._config_valid()),
+            not busy and connected,                      # firefox
+            bool(socks.get("enabled")), not busy,        # copy socks
+            bool(http.get("enabled")),                   # copy http
+            "Stop VM" if self._vm_running() else "Start VM",
+            not busy,
+            window_visible,
+            vc.autostart_enabled(), not busy,
+            self._version_label(),
+        )
+
+    def _version_label(self):
+        label = "VM VPN %s" % vc.VERSION
+        cli_version = (self.status or {}).get("version")
+        if cli_version and cli_version != vc.VERSION:
+            label += " (CLI %s)" % cli_version
+        return label
+
+    def _rebuild_menu(self):
+        sig = self._menu_signature()
+        if sig == self._menu_sig:
+            return
+        self._menu_sig = sig
+
+        menu = Gtk.Menu()
+        busy = self._busy()
+
+        header = Gtk.MenuItem(label=self._header_text())
+        header.set_sensitive(False)
+        header.show()
+        menu.append(header)
+
+        if self._connected():
+            proxies = self._proxies()
+            socks = proxies.get("socks") or {}
+            http = proxies.get("http") or {}
+            parts = []
+            if socks.get("enabled") and socks.get("running"):
+                parts.append("SOCKS 127.0.0.1:%s" % socks.get("port"))
+            if http.get("enabled") and http.get("running"):
+                parts.append("HTTP 127.0.0.1:%s" % http.get("port"))
+            if parts:
+                proxy_line = Gtk.MenuItem(label=" · ".join(parts))
+                proxy_line.set_sensitive(False)
+                proxy_line.show()
+                menu.append(proxy_line)
+
+        menu.append(self._sep())
+
+        if self._connected():
+            conn_item = Gtk.MenuItem(label="Disconnect")
+            conn_item.connect("activate", self._on_disconnect)
+            conn_item.set_sensitive(not busy)
+        else:
+            conn_item = Gtk.MenuItem(label="Connect")
+            conn_item.connect("activate", self._on_connect)
+            conn_item.set_sensitive(not busy and self._config_valid())
+        conn_item.show()
+        menu.append(conn_item)
+
+        firefox_item = Gtk.MenuItem(label="Launch VPN Firefox")
+        firefox_item.set_sensitive(not busy and self._connected())
+        firefox_item.connect("activate", self._on_firefox)
+        firefox_item.show()
+        menu.append(firefox_item)
+
+        proxies = self._proxies()
+        socks = proxies.get("socks") or {}
+        http = proxies.get("http") or {}
+        if socks.get("enabled"):
+            item = Gtk.MenuItem(label="Copy SOCKS proxy address")
+            item.connect(
+                "activate",
+                lambda *_: self._copy_to_clipboard(
+                    "socks5h://127.0.0.1:%s" % socks.get("port", 1080)
+                ),
+            )
+            item.set_sensitive(not busy)
+            item.show()
+            menu.append(item)
+        if http.get("enabled"):
+            item = Gtk.MenuItem(label="Copy HTTP proxy address")
+            item.connect(
+                "activate",
+                lambda *_: self._copy_to_clipboard(
+                    "http://127.0.0.1:%s" % http.get("port", 3128)
+                ),
+            )
+            item.set_sensitive(not busy)
+            item.show()
+            menu.append(item)
+
+        menu.append(self._sep())
+
+        vm_item = Gtk.MenuItem(label="Stop VM" if self._vm_running() else "Start VM")
+        vm_item.set_sensitive(not busy)
+        vm_item.connect("activate", self._on_vm_toggle)
+        vm_item.show()
+        menu.append(vm_item)
+
+        menu.append(self._sep())
+
+        window_bin = os.path.join(SCRIPT_DIR, "vmvpn-window")
+        if os.path.isfile(window_bin) and os.access(window_bin, os.X_OK):
+            open_item = Gtk.MenuItem(label="Open VM VPN…")
+            open_item.connect(
+                "activate", lambda *_: self._spawn_detached(window_bin)
+            )
+            open_item.show()
+            menu.append(open_item)
+
+        autostart_item = Gtk.CheckMenuItem(label="Start at login")
+        autostart_item.set_active(vc.autostart_enabled())
+        autostart_item.set_sensitive(not busy)
+        autostart_item.connect("toggled", self._on_autostart_toggled)
+        autostart_item.show()
+        menu.append(autostart_item)
+
+        version_item = Gtk.MenuItem(label=self._version_label())
+        version_item.set_sensitive(False)
+        version_item.show()
+        menu.append(version_item)
+
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", self._on_quit_item)
+        quit_item.show()
+        menu.append(quit_item)
+
+        menu.show_all()
+        # Detach the previous secondary-activate target before its menu is
+        # torn down, or libayatana emits a gtk_widget_get_parent critical.
+        self.indicator.set_secondary_activate_target(None)
+        self.indicator.set_menu(menu)
+        self.indicator.set_secondary_activate_target(conn_item)
+        self.menu = menu
+
+    # -- actions ---------------------------------------------------------------
+
+    def _connect(self, *_args):
+        if self._busy():
+            return
+        self.user_action_pending = True
+        self.action_running = True
+        self.action = "connect"
+        self._refresh_ui()
+        self.flow = vc.ConnectFlow(
+            self._ask_password, self._ask_trust, self._connect_done
+        )
+        self.flow.start()
+
+    def _connect_done(self, rc, stdout, stderr):
+        self.flow = None
+        self.action_running = False
+        self.action = None
+        if rc == vc.EXIT_OK:
+            self.last_failed = False
+            self._notify("VM VPN", "VPN connected.", ICON_CONNECTED)
+        else:
+            if rc != vc.EXIT_PASSWORD_REQUIRED:
+                # rc 4 means the user cancelled the password dialog: stay silent
+                self.last_failed = True
+                self._notify_failure("Connect", rc, stdout, stderr)
+        self._refresh_ui()
+        self._poll()
+
+    def _on_connect(self, *_args):
+        self._connect()
+
+    def _on_disconnect(self, *_args):
+        self._run_action("disconnect", ["vpn-disconnect"])
+
+    def _on_firefox(self, *_args):
+        self._run_action("firefox", ["firefox"])
+
+    def _on_vm_toggle(self, *_args):
+        if self._vm_running():
+            self._run_action("stop", ["stop"])
+        else:
+            self._run_action("start", ["start"])
+
+    def _run_action(self, action, args):
+        if self._busy():
+            return
+        self.user_action_pending = True
+        self.action_running = True
+        self.action = action
+        self._refresh_ui()
+
+        def done(rc, stdout, stderr):
+            self.action_running = False
+            self.action = None
+            if rc == vc.EXIT_OK:
+                self.last_failed = False
+                if action == "disconnect":
+                    self._notify("VM VPN", "VPN disconnected.", ICON_DISCONNECTED)
+            else:
+                self.last_failed = True
+                self._notify_failure(action, rc, stdout, stderr)
+            self._refresh_ui()
+            self._poll()
+
+        vc.run_cli(args, done)
+
+    @staticmethod
+    def _spawn_detached(path):
+        try:
+            subprocess.Popen(
+                [path],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except OSError:
+            pass
+
+    @staticmethod
+    def _copy_to_clipboard(text):
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clipboard.set_text(text, -1)
+        clipboard.store()
+
+    # -- autostart ---------------------------------------------------------------
+
+    def _on_autostart_toggled(self, item):
+        vc.set_autostart(item.get_active(), os.path.realpath(__file__))
+
+    # -- dialogs -------------------------------------------------------------------
+
+    def _ask_password(self, error_message, cb):
+        cfg = self._cfg()
+        username = cfg.get("username")
+        gateway = cfg.get("gateway")
+        if username and gateway:
+            prompt = "VPN password for %s@%s" % (username, gateway)
+        else:
+            prompt = "VPN password"
+
+        dialog = Gtk.Dialog(title="VM VPN")
+        dialog.add_buttons(
+            "_Cancel", Gtk.ResponseType.CANCEL,
+            "_Connect", Gtk.ResponseType.OK,
+        )
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        box = dialog.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(12)
+
+        label = Gtk.Label(label=prompt)
+        label.set_xalign(0.0)
+        box.pack_start(label, False, False, 0)
+
+        if error_message:
+            err_label = Gtk.Label()
+            err_label.set_markup(
+                '<span foreground="red">%s</span>'
+                % GLib.markup_escape_text(error_message)
+            )
+            err_label.set_xalign(0.0)
+            box.pack_start(err_label, False, False, 0)
+
+        entry = Gtk.Entry()
+        entry.set_visibility(False)
+        entry.set_activates_default(True)
+        box.pack_start(entry, False, False, 0)
+
+        remember = Gtk.CheckButton(label="Remember in GNOME keyring")
+        box.pack_start(remember, False, False, 0)
+
+        self._dialogs.append(dialog)
+
+        def on_response(dlg, response):
+            if dlg in self._dialogs:
+                self._dialogs.remove(dlg)
+            if response == Gtk.ResponseType.OK:
+                password = entry.get_text()
+                cb(password if password else None, remember.get_active())
+            else:
+                cb(None, False)
+            dlg.destroy()
+
+        dialog.connect("response", on_response)
+        dialog.show_all()
+        dialog.present()
+
+    def _ask_trust(self, new_fp, saved_fp, cb):
+        if saved_fp:
+            message_type = Gtk.MessageType.WARNING
+            text = "VPN server certificate has CHANGED"
+            secondary = (
+                "Saved fingerprint:\n<tt>%s</tt>\n\nNew fingerprint:\n"
+                "<tt>%s</tt>\n\nThis could indicate a man-in-the-middle "
+                "attack or a legitimate certificate update.\n"
+                "Trust the new certificate?"
+                % (
+                    GLib.markup_escape_text(saved_fp),
+                    GLib.markup_escape_text(new_fp),
+                )
+            )
+        else:
+            message_type = Gtk.MessageType.QUESTION
+            text = "New VPN server certificate"
+            secondary = (
+                "Fingerprint (SHA1):\n<tt>%s</tt>\n\n"
+                "Trust this certificate and save the fingerprint?"
+                % GLib.markup_escape_text(new_fp)
+            )
+
+        dialog = Gtk.MessageDialog(
+            transient_for=None,
+            flags=0,
+            message_type=message_type,
+            buttons=Gtk.ButtonsType.NONE,
+            text=text,
+        )
+        dialog.format_secondary_markup(secondary)
+        dialog.add_buttons(
+            "_Cancel", Gtk.ResponseType.CANCEL,
+            "_Trust", Gtk.ResponseType.OK,
+        )
+        self._dialogs.append(dialog)
+
+        def on_response(dlg, response):
+            if dlg in self._dialogs:
+                self._dialogs.remove(dlg)
+            cb(response == Gtk.ResponseType.OK)
+            dlg.destroy()
+
+        dialog.connect("response", on_response)
+        dialog.show_all()
+        dialog.present()
+
+    # -- notifications -------------------------------------------------------------
+
+    def _notify(self, summary, body="", icon=ICON_CONNECTED):
+        if _NOTIFY_OK:
+            try:
+                notification = Notify.Notification.new(summary, body, icon)
+                notification.show()
+                return
+            except Exception:
+                pass
+        try:
+            subprocess.Popen(
+                ["notify-send", summary, body],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            pass  # silent fallback
+
+    def _notify_failure(self, action, rc, stdout, stderr):
+        if rc == vc.EXIT_BUSY:
+            self._notify(
+                "Another vmvpn operation is in progress", "", ICON_NO_ROUTE
+            )
+            return
+        if rc == vc.EXIT_LOGIN_FAILED:
+            self._notify(
+                "VPN login failed", "Check your credentials.", ICON_NO_ROUTE
+            )
+            return
+        if rc == vc.EXIT_CERT_UNTRUSTED:
+            self._notify(
+                "VPN certificate rejected",
+                "The server certificate was not trusted.",
+                ICON_NO_ROUTE,
+            )
+            return
+        if rc == vc.EXIT_CONFIG_INVALID:
+            path = self._cfg().get("path") or os.environ.get(
+                "VPN_CONFIG", "vpn-config.json"
+            )
+            self._notify(
+                "VPN config missing or invalid: %s" % path,
+                "",
+                ICON_NO_ROUTE,
+            )
+            return
+        detail = ""
+        for line in reversed((stderr or "").splitlines()):
+            if line.strip():
+                detail = line.strip()
+                break
+        if not detail:
+            for line in reversed((stdout or "").splitlines()):
+                if line.strip():
+                    detail = line.strip()
+                    break
+        self._notify("%s failed" % action, detail, ICON_NO_ROUTE)
+
+    def _on_quit_item(self, *_args):
+        self._quit()
+
+
+def main():
+    if any(a in ("--version", "-V") for a in sys.argv[1:]):
+        print("vmvpn-tray %s" % vc.VERSION)
+        return 0
+    app = TrayApp()
+    return app.app.run([sys.argv[0]])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

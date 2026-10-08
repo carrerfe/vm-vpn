@@ -3,3 +3,6 @@ vpn-config.json
 
 # Certificate fingerprint (host-specific)
 .vpn-cert-fingerprint
+
+# Python bytecode caches
+__pycache__/
