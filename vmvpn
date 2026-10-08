@@ -81,8 +81,8 @@ run_locked() {
     ( exec 9>&-; "$@" )
 }
 
-# True when another vmvpn process holds the operation lock.
-operation_in_progress() {
+# True when the operation lock is free (no other vmvpn process holds it).
+operation_lock_free() {
     local lock_file="${XDG_RUNTIME_DIR:-/tmp}/vmvpn-${VM_NAME}.lock"
     ( exec 9>"$lock_file"; flock -n 9 ) 2>/dev/null
 }
@@ -183,7 +183,7 @@ status_json() {
 
     # --- Operation lock state (some other vmvpn command is acting) ---
     local busy=false
-    if ! operation_in_progress; then
+    if ! operation_lock_free; then
         busy=true
     fi
 

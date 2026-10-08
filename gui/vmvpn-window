@@ -443,6 +443,7 @@ class LogsPage(Gtk.Box):
         scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         self.text_view = Gtk.TextView()
         self.text_view.set_monospace(True)
+        self.text_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self.text_view.set_editable(False)
         self.text_view.set_cursor_visible(False)
         self.buffer = self.text_view.get_buffer()
@@ -552,13 +553,18 @@ class LogsPage(Gtk.Box):
                 if rc == vc.EXIT_OK:
                     self._set_text(stdout or "(no output)\n")
                 else:
+                    detail = _last_line(stderr) or _last_line(stdout)
+                    vc.log_line(
+                        "logs %s failed (exit %s): %s"
+                        % (src.ref, rc, detail or "no output")
+                    )
                     self._set_text(
                         "logs %s failed (exit %s):\n%s"
                         % (src.ref, rc, stderr or stdout)
                     )
 
             vc.run_cli(
-                ["logs", src.ref, "-n", str(LOG_MAX_LINES)], done, log=True
+                ["logs", src.ref, "-n", str(LOG_MAX_LINES)], done, log=False
             )
         else:
             self._load_file_tail(src.ref)
@@ -1301,21 +1307,25 @@ class MainWindow(Adw.ApplicationWindow):
         if saved_fp:
             heading = "VPN server certificate has changed"
             body = (
-                "Saved fingerprint:\n%s\n\nNew fingerprint:\n%s\n\n"
-                "This could indicate a man-in-the-middle attack or a "
-                "legitimate certificate update.\n"
-                "Trust the new certificate?" % (saved_fp, new_fp)
+                "Saved fingerprint:\n<tt>%s</tt>\n\nNew fingerprint:\n"
+                "<tt>%s</tt>\n\nThis could indicate a man-in-the-middle "
+                "attack or a legitimate certificate update.\n"
+                "Trust the new certificate?"
+                % (_escape(saved_fp), _escape(new_fp))
             )
             appearance = Adw.ResponseAppearance.DESTRUCTIVE
         else:
             heading = "New VPN server certificate"
             body = (
-                "Fingerprint (SHA1):\n%s\n\n"
-                "Trust this certificate and save the fingerprint?" % new_fp
+                "Fingerprint (SHA1):\n<tt>%s</tt>\n\n"
+                "Trust this certificate and save the fingerprint?"
+                % _escape(new_fp)
             )
             appearance = Adw.ResponseAppearance.SUGGESTED
 
-        dialog = Adw.AlertDialog(heading=heading, body=body)
+        dialog = Adw.AlertDialog(heading=heading)
+        dialog.set_body_use_markup(True)
+        dialog.set_body(body)
         dialog.add_response("cancel", "_Cancel")
         dialog.add_response("trust", "_Trust")
         dialog.set_response_appearance("trust", appearance)

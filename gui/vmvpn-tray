@@ -515,17 +515,22 @@ class TrayApp:
             message_type = Gtk.MessageType.WARNING
             text = "VPN server certificate has CHANGED"
             secondary = (
-                "Saved fingerprint:\n  %s\n\nNew fingerprint:\n  %s\n\n"
-                "This could indicate a man-in-the-middle attack or a "
-                "legitimate certificate update.\n"
-                "Trust the new certificate?" % (saved_fp, new_fp)
+                "Saved fingerprint:\n<tt>%s</tt>\n\nNew fingerprint:\n"
+                "<tt>%s</tt>\n\nThis could indicate a man-in-the-middle "
+                "attack or a legitimate certificate update.\n"
+                "Trust the new certificate?"
+                % (
+                    GLib.markup_escape_text(saved_fp),
+                    GLib.markup_escape_text(new_fp),
+                )
             )
         else:
             message_type = Gtk.MessageType.QUESTION
             text = "New VPN server certificate"
             secondary = (
-                "Fingerprint (SHA1):\n  %s\n\n"
-                "Trust this certificate and save the fingerprint?" % new_fp
+                "Fingerprint (SHA1):\n<tt>%s</tt>\n\n"
+                "Trust this certificate and save the fingerprint?"
+                % GLib.markup_escape_text(new_fp)
             )
 
         dialog = Gtk.MessageDialog(
@@ -535,7 +540,7 @@ class TrayApp:
             buttons=Gtk.ButtonsType.NONE,
             text=text,
         )
-        dialog.format_secondary_text(secondary)
+        dialog.format_secondary_markup(secondary)
         dialog.add_buttons(
             "_Cancel", Gtk.ResponseType.CANCEL,
             "_Trust", Gtk.ResponseType.OK,

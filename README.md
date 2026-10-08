@@ -39,6 +39,10 @@ vmvpn firefox
 
 That's it! Firefox will open with a special profile that routes all traffic through the VPN.
 
+> Prefer a GUI? The installer also sets up **VM VPN** in your app grid
+> (`vmvpn-window`) and a tray icon (`vmvpn-tray`) — see
+> [Desktop GUI](#desktop-gui-gnome--kde).
+
 ## How It Works
 
 1. **VM VPN** creates a small Ubuntu 24.04 VM with FortiClient pre-installed
@@ -210,8 +214,14 @@ eval "$(./vmvpn completion zsh)"
 .
 ├── vmvpn                   # CLI script
 ├── vmvpn.yaml              # Lima VM configuration
+├── install.sh              # Installer / updater
 ├── vpn-config.json.example # VPN config template
 ├── vpn-config.json         # Your VPN credentials (gitignored)
+├── gui/
+│   ├── vmvpn_common.py     # Shared helpers (Gtk-free)
+│   ├── vmvpn-tray          # GTK3 + AppIndicator tray icon
+│   ├── vmvpn-window        # GTK4 + libadwaita window
+│   └── tests/              # Unit tests (no Gtk needed)
 └── README.md
 ```
 
@@ -302,6 +312,62 @@ operation lock above).
 **Environment:** `VPN_CONFIG` overrides the config path (default
 `./vpn-config.json`); `VMVPN_VM_NAME` overrides the Lima VM name (default
 `vmvpn`).
+
+## Desktop GUI (GNOME / KDE)
+
+Two GUI front-ends drive the CLI without a terminal:
+
+- **`vmvpn-tray`** — a tray icon (StatusNotifierItem). Shows VPN/VM state at a
+  glance and offers Connect/Disconnect, proxy-address copy, "Launch VPN
+  Firefox", Start/Stop VM, "Open VM VPN…", a "Start at login" autostart
+  toggle, and Quit. It also shows desktop notifications (connect, disconnect,
+  login failed, certificate rejected, VPN connection lost).
+- **`vmvpn-window`** — a GTK4/libadwaita window (also in the app grid as
+  "VM VPN") with three pages:
+  - **Status**: VM name/state/CPUs/memory/disk, guest memory + swap bars,
+    Squid state, VPN state with Connect/Disconnect, proxy cards with copy
+    buttons, Firefox launch, config/cert info.
+  - **Logs**: GUI activity, Lima host-agent and serial logs, and guest
+    `journal`/`squid`/`forticlient` logs, with tail-view, auto-refresh,
+    copy, and open-folder.
+  - **Settings**: edit `vpn-config.json` (gateway/port/username, proxies,
+    certificate, startup), with Apply/Revert and a keyring password store.
+
+Password dialogs offer "Remember in GNOME keyring"; when the server
+certificate is new or changed you get a trust dialog showing the fingerprint
+in monospace (a *changed* fingerprint is flagged as a possible MITM attack).
+
+Both processes poll `vmvpn status --json`, respect the CLI operation lock
+(`busy`), and write activity to `$XDG_STATE_HOME/vmvpn/gui.log`.
+
+> **Why is the tray GTK3?** GTK4 has no tray API, and the GTK-free
+> libayatana-appindicator-glib menus don't render on GNOME
+> (AyatanaIndicators/libayatana-appindicator-glib#102, still open; GNOME's
+> appindicator extension declined the GMenu-based protocol —
+> ubuntu/gnome-shell-extension-appindicator#597). The tray therefore uses
+> GTK3 + AyatanaAppIndicator3 in a separate process.
+
+### GUI dependencies
+
+- Ubuntu/Debian: `sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-gtk-4.0
+  gir1.2-adw-1 gir1.2-ayatanaappindicator3-0.1 gir1.2-notify-0.7
+  libsecret-tools`
+- Fedora: `sudo dnf install python3-gobject gtk3 gtk4 libadwaita
+  libayatana-appindicator-gtk3 libnotify libsecret`
+- GNOME needs the AppIndicator extension for the tray (enabled by default on
+  Ubuntu; Fedora: `gnome-shell-extension-appindicator`). KDE Plasma shows the
+  tray natively.
+
+The installer checks these and prints hints; the CLI works without them.
+
+### Uninstalling the GUI
+
+```bash
+rm -f ~/.local/bin/vmvpn-tray ~/.local/bin/vmvpn-window
+rm -rf ~/.local/bin/vmvpn-gui
+rm -f ~/.local/share/applications/io.github.carrerfe.VmVpn.desktop
+rm -f ~/.config/autostart/vmvpn-tray.desktop   # if "Start at login" was on
+```
 
 ### Manual Connection (Inside VM)
 

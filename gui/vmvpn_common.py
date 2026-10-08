@@ -74,6 +74,11 @@ def _append_log(text):
         pass
 
 
+def log_line(text):
+    """Append a single timestamped line to the GUI log."""
+    _append_log("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), text))
+
+
 def _log_result(rc, stdout, stderr):
     buf = ""
     if stdout:
