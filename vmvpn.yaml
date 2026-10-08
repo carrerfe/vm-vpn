@@ -7,8 +7,8 @@ images:
     arch: "aarch64"
 
 cpus: 2
-memory: "1GiB"
-disk: "10GiB"
+memory: "512MiB"
+disk: "20GiB"
 
 mounts: []
 
@@ -17,6 +17,24 @@ containerd:
   user: false
 
 provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+
+      # 4 GiB swap file to compensate for the small RAM allocation
+      if [ ! -f /swapfile ]; then
+        fallocate -l 4G /swapfile
+        chmod 600 /swapfile
+        mkswap /swapfile
+      fi
+      grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+      swapon --show=NAME --noheadings | grep -qx /swapfile || swapon /swapfile
+
+      # Prefer swapping out idle anonymous memory over OOM-killing
+      echo 'vm.swappiness=100' > /etc/sysctl.d/99-vmvpn-swap.conf
+      sysctl -p /etc/sysctl.d/99-vmvpn-swap.conf
+
   - mode: system
     script: |
       #!/bin/bash

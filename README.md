@@ -215,7 +215,7 @@ eval "$(./vmvpn completion zsh)"
 
 - **OS**: Ubuntu 24.04 LTS (cloud image)
 - **CPUs**: 2
-- **Memory**: 4 GiB
+- **Memory**: 512 MiB + 4 GiB swap file (`vm.swappiness=100`), sized for 6-8 GB edge hosts
 - **Disk**: 20 GiB
 - **FortiClient**: 7.4.x (installed from official Fortinet repo)
 - Pre-installed tools: `curl`, `wget`, `vim`, `htop`, `net-tools`, `iproute2`
@@ -316,7 +316,7 @@ Edit `vmvpn.yaml` to customize:
 
 ```yaml
 cpus: 2          # Number of CPUs
-memory: "4GiB"   # RAM allocation
+memory: "512MiB" # RAM allocation
 disk: "20GiB"    # Disk size
 ```
 
