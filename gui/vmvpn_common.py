@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 
@@ -18,7 +19,7 @@ gi.require_version("GLib", "2.0")
 gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # Exit codes of the vmvpn CLI (see `vmvpn` usage / README).
 EXIT_OK = 0
@@ -278,50 +279,84 @@ def parse_cert_untrusted(stdout):
     return match.group(1), (match.group(2) or None)
 
 
-# -- autostart ---------------------------------------------------------------
+# -- UI management -----------------------------------------------------------
+#
+# The vmvpn CLI owns every piece of UI state: the ui.json preferences, the
+# autostart desktop entries and starting/stopping the tray and window
+# processes. The helpers below are thin wrappers — nothing here writes
+# desktop entries or prefs files directly.
 
-_AUTOSTART_DESKTOP = "vmvpn-tray.desktop"
+
+def _cli_call(*args, timeout=15):
+    """Run `vmvpn <args>` synchronously; returns (rc, stdout, stderr)."""
+    cli = find_cli()
+    if cli is None:
+        return EXIT_ERROR, "", "vmvpn CLI not found"
+    try:
+        proc = subprocess.run(
+            [cli, *args],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return EXIT_ERROR, "", str(exc)
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
-def autostart_path():
-    """Path of the tray's XDG autostart desktop entry."""
-    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
-        os.path.expanduser("~"), ".config"
+def status_json():
+    """Parsed `vmvpn status --json` dict, or None on failure."""
+    rc, out, _err = _cli_call("status", "--json")
+    if rc != 0:
+        return None
+    return parse_status(out)
+
+
+def ui_state():
+    """The `ui` block of `status --json` (tray_enabled, running flags…)."""
+    status = status_json() or {}
+    ui = status.get("ui")
+    return ui if isinstance(ui, dict) else {}
+
+
+def release_line():
+    """`vmvpn --version` output ('vmvpn X.Y.Z (commit, ref, …)')."""
+    rc, out, _err = _cli_call("--version")
+    if rc == 0 and out.strip():
+        return out.strip()
+    return "vmvpn %s" % VERSION
+
+
+def _noop(_rc, _out, _err):
+    pass
+
+
+def set_tray_enabled(enabled, callback=None):
+    """Ask the CLI to enable/disable the tray (pref + autostart + process)."""
+    return run_cli(
+        ["ui", "tray", "on" if enabled else "off"], callback or _noop
     )
-    return os.path.join(config_home, "autostart", _AUTOSTART_DESKTOP)
 
 
-def autostart_enabled():
-    return os.path.exists(autostart_path())
+def set_setup_prompt(enabled, callback=None):
+    """Ask the CLI to toggle the 'propose setup at login' preference."""
+    return run_cli(
+        ["ui", "setup-prompt", "on" if enabled else "off"],
+        callback or _noop,
+    )
 
 
-def _desktop_exec_quote(path):
-    """Quote an Exec value per the Desktop Entry spec.
+def set_vm_autostart(enabled, callback=None):
+    """Ask the CLI to enable/disable VM start at login."""
+    return run_cli(
+        ["vm-autostart", "on" if enabled else "off"], callback or _noop
+    )
 
-    Wrap in double quotes, backslash-escape `"` `` ` `` `$` `\\`.
-    """
-    return '"' + re.sub(r"([" + '"' + "`$\\\\])", r"\\\1", path) + '"'
 
-
-def set_autostart(enabled, tray_path):
-    """Create or remove the XDG autostart entry for the tray script."""
-    path = autostart_path()
-    if enabled:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(
-                "[Desktop Entry]\n"
-                "Type=Application\n"
-                "Name=VM VPN Tray\n"
-                "Exec=%s\n" % _desktop_exec_quote(os.path.realpath(tray_path))
-                + "Icon=network-vpn\n"
-                "X-GNOME-Autostart-enabled=true\n"
-            )
-    else:
-        try:
-            os.remove(path)
-        except FileNotFoundError:
-            pass
+def open_ui(page, callback=None):
+    """Ask the CLI to open/present the app window on `page`."""
+    return run_cli(["ui", page], callback or _noop)
 
 
 # -- config ------------------------------------------------------------------

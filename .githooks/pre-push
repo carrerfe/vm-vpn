@@ -1,0 +1,23 @@
+#!/bin/bash
+# pre-push hook: when pushing a tag vX.Y.Z, require that VMVPN_VERSION at
+# the tagged commit equals X.Y.Z — a tag must never point at a commit whose
+# CLI reports a different version.
+#
+# Enable with:  git config core.hooksPath .githooks
+
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+    case "$remote_ref" in
+        refs/tags/v[0-9]*.[0-9]*.[0-9]*)
+            tag_version="${remote_ref#refs/tags/v}"
+            cli_version=$(git show "$local_sha^{commit}:vmvpn" 2>/dev/null \
+                | sed -n 's/^VMVPN_VERSION="\(.*\)"$/\1/p' | head -1)
+            if [[ "$cli_version" != "$tag_version" ]]; then
+                echo "pre-push: rejecting $remote_ref —" >&2
+                echo "  VMVPN_VERSION at $local_sha is '$cli_version'," >&2
+                echo "  expected '$tag_version'." >&2
+                exit 1
+            fi
+            ;;
+    esac
+done
+exit 0

@@ -446,35 +446,209 @@ class TestRunCliAndLog(FlowTestCase):
         self.assertIn("boom2", log)
 
 
-class TestAutostart(FlowTestCase):
-    def test_set_autostart_creates_and_removes_desktop_file(self):
-        tray = os.path.join(self.tmp, "vmvpn-tray")
-        self.assertFalse(vc.autostart_enabled())
-        vc.set_autostart(True, tray)
-        path = vc.autostart_path()
-        self.assertTrue(path.startswith(os.environ["XDG_CONFIG_HOME"]))
-        self.assertTrue(vc.autostart_enabled())
-        with open(path, encoding="utf-8") as f:
-            content = f.read()
-        self.assertIn("X-GNOME-Autostart-enabled=true", content)
-        vc.set_autostart(False, tray)
-        self.assertFalse(vc.autostart_enabled())
-        self.assertFalse(os.path.exists(path))
+class TestUiHelpers(FlowTestCase):
+    """UI prefs/autostart/processes are owned by the CLI — the GUI side is
+    only thin wrappers over `vmvpn ui …` and `vmvpn vm-autostart …`."""
 
-    def test_exec_is_quoted_and_escaped(self):
-        tray = os.path.join(self.tmp, 'we`ird "dir"$', "my tray")
-        vc.set_autostart(True, tray)
-        with open(vc.autostart_path(), encoding="utf-8") as f:
-            exec_line = next(
-                l for l in f if l.startswith("Exec=")
-            ).rstrip("\n")
-        expected = 'Exec="%s"' % re.sub(
-            r"([" + '"' + "`$\\\\])", r"\\\1", tray
+    def _run(self, fn, *args):
+        self.done = None
+        fn(*args, self._on_done)
+        drive(lambda: self.done is not None)
+
+    def test_set_tray_enabled_calls_cli(self):
+        self._run(vc.set_tray_enabled, True)
+        self.assertEqual(self.stub.calls(), ["ui tray on"])
+        self.stub.add_step()
+        self._run(vc.set_tray_enabled, False)
+        self.assertEqual(self.stub.calls(), ["ui tray on", "ui tray off"])
+
+    def test_set_setup_prompt_calls_cli(self):
+        self._run(vc.set_setup_prompt, False)
+        self.assertEqual(self.stub.calls(), ["ui setup-prompt off"])
+
+    def test_set_vm_autostart_calls_cli(self):
+        self._run(vc.set_vm_autostart, True)
+        self.assertEqual(self.stub.calls(), ["vm-autostart on"])
+
+    def test_open_ui_calls_cli_with_page(self):
+        self._run(vc.open_ui, "settings")
+        self.assertEqual(self.stub.calls(), ["ui settings"])
+
+    def test_ui_state_reads_status_json(self):
+        self.stub.add_step(out=json.dumps({
+            "ui": {"tray_enabled": False, "tray_running": True,
+                   "window_running": False, "setup_prompt": True},
+        }))
+        ui = vc.ui_state()
+        self.assertFalse(ui["tray_enabled"])
+        self.assertTrue(ui["tray_running"])
+        self.assertEqual(self.stub.calls(), ["status --json"])
+
+    def test_ui_state_empty_on_failure(self):
+        self.stub.add_step(rc=1, err="boom")
+        self.assertEqual(vc.ui_state(), {})
+
+    def test_release_line(self):
+        self.stub.add_step(out="vmvpn 1.1.0 (abc123, main, installed x)\n")
+        self.assertEqual(
+            vc.release_line(), "vmvpn 1.1.0 (abc123, main, installed x)"
         )
-        self.assertEqual(exec_line, expected)
-        # no unescaped specials inside the quotes
-        inner = exec_line[len('Exec="') : -1]
-        self.assertNotRegex(inner, r'(?<!\\)["`$]')
+        self.assertEqual(self.stub.calls(), ["--version"])
+
+    def test_release_line_fallback_on_failure(self):
+        self.stub.add_step(rc=1)
+        self.assertEqual(vc.release_line(), "vmvpn %s" % vc.VERSION)
+
+
+class TestCliUiPrefs(unittest.TestCase):
+    """ui.json semantics, exercised through the real CLI (bash)."""
+
+    def _cli_path(self):
+        return os.path.realpath(
+            os.path.join(os.path.dirname(vc.__file__), "..", "vmvpn")
+        )
+
+    def _run_cli(self, tmp, *args):
+        env = dict(
+            os.environ,
+            XDG_CONFIG_HOME=os.path.join(tmp, "config"),
+            XDG_STATE_HOME=os.path.join(tmp, "state"),
+            XDG_DATA_HOME=os.path.join(tmp, "data"),
+            VMVPN_VM_NAME="vmvpn-unittest-nonexistent",
+            VPN_CONFIG=os.path.join(tmp, "vpn-config.json"),
+            DISPLAY="",
+            WAYLAND_DISPLAY="",
+        )
+        return subprocess.run(
+            [self._cli_path(), *args],
+            capture_output=True, text=True, timeout=30, env=env,
+            stdin=subprocess.DEVNULL,
+        )
+
+    def _prefs(self, tmp):
+        path = os.path.join(tmp, "config", "vmvpn", "ui.json")
+        if not os.path.exists(path):
+            return None
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_defaults_when_file_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._run_cli(tmp, "ui", "tray")
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("enabled", out.stdout)
+            out = self._run_cli(tmp, "ui", "setup-prompt")
+            self.assertIn("enabled", out.stdout)
+
+    def test_tray_off_writes_pref_and_removes_autostart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run_cli(tmp, "ui", "tray", "on")
+            autostart = os.path.join(
+                tmp, "config", "autostart", "vmvpn-tray.desktop"
+            )
+            with open(autostart, encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn('ui --login', content)
+            self.assertIn('"', content)  # Exec path is quoted
+            out = self._run_cli(tmp, "ui", "tray", "off")
+            self.assertIn("disabled", out.stdout)
+            self.assertFalse(os.path.exists(autostart))
+            self.assertEqual(self._prefs(tmp), {"tray": False})
+
+    def test_unknown_keys_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefs_dir = os.path.join(tmp, "config", "vmvpn")
+            os.makedirs(prefs_dir)
+            with open(os.path.join(prefs_dir, "ui.json"), "w") as f:
+                json.dump({"custom_key": {"x": 1}, "tray": True}, f)
+            self._run_cli(tmp, "ui", "setup-prompt", "off")
+            prefs = self._prefs(tmp)
+            self.assertEqual(prefs["custom_key"], {"x": 1})
+            self.assertFalse(prefs["setup_prompt"])
+            self.assertTrue(prefs["tray"])
+
+    def _fake_install(self, tmp):
+        """A fake installed layout: <tmp>/install/vmvpn + vmvpn-gui/."""
+        inst = os.path.join(tmp, "install")
+        os.makedirs(os.path.join(inst, "vmvpn-gui"), exist_ok=True)
+        cli = os.path.join(inst, "vmvpn")
+        with open(self._cli_path(), "rb") as f:
+            data = f.read()
+        with open(cli, "wb") as f:
+            f.write(data)
+        os.chmod(cli, 0o755)
+        return cli
+
+    def _run_installed(self, tmp, *args):
+        env = dict(
+            os.environ,
+            XDG_CONFIG_HOME=os.path.join(tmp, "config"),
+            XDG_STATE_HOME=os.path.join(tmp, "state"),
+            XDG_DATA_HOME=os.path.join(tmp, "data"),
+            VMVPN_VM_NAME="vmvpn-unittest-nonexistent",
+            VPN_CONFIG=os.path.join(tmp, "vpn-config.json"),
+            DISPLAY="",
+            WAYLAND_DISPLAY="",
+        )
+        return subprocess.run(
+            [self._fake_install(tmp), *args],
+            capture_output=True, text=True, timeout=30, env=env,
+            stdin=subprocess.DEVNULL,
+        )
+
+    def test_old_autostart_entry_migrated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inst_cli = self._fake_install(tmp)
+            auto_dir = os.path.join(tmp, "config", "autostart")
+            os.makedirs(auto_dir)
+            entry = os.path.join(auto_dir, "vmvpn-tray.desktop")
+            with open(entry, "w", encoding="utf-8") as f:
+                f.write("[Desktop Entry]\nType=Application\n"
+                        'Exec="%s/vmvpn-gui/vmvpn-tray"\n'
+                        % os.path.dirname(inst_cli))
+            out = self._run_installed(tmp, "ui", "tray")
+            self.assertEqual(out.returncode, 0, out.stderr)
+            with open(entry, encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn('Exec="%s" ui --login' % inst_cli, content)
+
+    def test_autostart_entry_pointing_elsewhere_not_rewritten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._fake_install(tmp)
+            auto_dir = os.path.join(tmp, "config", "autostart")
+            os.makedirs(auto_dir)
+            entry = os.path.join(auto_dir, "vmvpn-tray.desktop")
+            for exec_line in (
+                'Exec="/other/install/vmvpn" ui --login',
+                'Exec="/other/install/vmvpn-gui/vmvpn-tray"',
+            ):
+                with open(entry, "w", encoding="utf-8") as f:
+                    f.write("[Desktop Entry]\nType=Application\n"
+                            + exec_line + "\n")
+                out = self._run_installed(tmp, "ui", "tray")
+                self.assertEqual(out.returncode, 0, out.stderr)
+                with open(entry, encoding="utf-8") as f:
+                    self.assertIn(exec_line, f.read())
+
+    def test_checkout_never_touches_autostart(self):
+        """A checkout's `ui`/`ui --login`/`ui tray` must not write the
+        login autostart entry (that's the installed layout's job)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._run_cli(tmp, "ui", "tray")   # default pref: on
+            self.assertEqual(out.returncode, 0, out.stderr)
+            out = self._run_cli(tmp, "ui", "--login")
+            self.assertEqual(out.returncode, 0, out.stderr)
+            out = self._run_cli(tmp, "ui")           # no display -> rc 1
+            self.assertEqual(out.returncode, 1)
+            self.assertFalse(os.path.exists(
+                os.path.join(tmp, "config", "autostart",
+                             "vmvpn-tray.desktop")))
+
+    def test_ui_without_display_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self._run_cli(tmp, "ui")
+            self.assertEqual(out.returncode, 1)
+            self.assertIn("graphical session", out.stderr)
 
 
 class TestConfigHelpers(FlowTestCase):
@@ -701,6 +875,36 @@ class TestFindFreePort(unittest.TestCase):
             s.close()
 
 
+class TestGuiExecutables(unittest.TestCase):
+    """vmvpn-tray / vmvpn-window are internal components: --help works with
+    no display, unknown options are rejected."""
+
+    GUI = os.path.dirname(vc.__file__)
+
+    def _run(self, script, *args):
+        env = dict(os.environ)
+        env.pop("DISPLAY", None)
+        env.pop("WAYLAND_DISPLAY", None)
+        return subprocess.run(
+            ["python3", os.path.join(self.GUI, script), *args],
+            capture_output=True, text=True, timeout=15, env=env,
+            stdin=subprocess.DEVNULL,
+        )
+
+    def test_help(self):
+        for script in ("vmvpn-tray", "vmvpn-window"):
+            out = self._run(script, "--help")
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("vmvpn ui", out.stdout)
+            self.assertIn("internal component", out.stdout)
+
+    def test_unknown_option_rejected(self):
+        for script in ("vmvpn-tray", "vmvpn-window"):
+            out = self._run(script, "--bogus")
+            self.assertEqual(out.returncode, 2)
+            self.assertIn("vmvpn ui", out.stderr)
+
+
 class TestVersion(FlowTestCase):
     def _cli_path(self):
         return os.path.realpath(
@@ -720,7 +924,34 @@ class TestVersion(FlowTestCase):
             capture_output=True, text=True, timeout=10,
         )
         self.assertEqual(out.returncode, 0)
-        self.assertEqual(out.stdout.strip(), "vmvpn %s" % vc.VERSION)
+        # release metadata may follow in parentheses; the prefix is fixed.
+        self.assertTrue(
+            out.stdout.startswith("vmvpn %s" % vc.VERSION),
+            "unexpected --version output: %r" % out.stdout,
+        )
+
+    def test_version_at_least_latest_tag(self):
+        """VMVPN_VERSION must be >= the latest reachable v* tag."""
+        repo = os.path.dirname(os.path.dirname(self._cli_path()))
+        is_wt = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True,
+        )
+        if is_wt.returncode != 0:
+            self.skipTest("not a git checkout")
+        tags = subprocess.run(
+            ["git", "-C", repo, "tag", "--merged", "HEAD",
+             "--list", "v[0-9]*", "--sort=-version:refname"],
+            capture_output=True, text=True, check=True,
+        ).stdout.split()
+        if not tags:
+            self.skipTest("no v* tags reachable")
+        latest = tuple(int(x) for x in tags[0].lstrip("v").split("."))
+        current = tuple(int(x) for x in vc.VERSION.split("."))
+        self.assertGreaterEqual(
+            current, latest,
+            "VERSION %s is older than tag %s" % (vc.VERSION, tags[0]),
+        )
 
 
 if __name__ == "__main__":

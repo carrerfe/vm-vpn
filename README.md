@@ -57,6 +57,7 @@ vmvpn setup            # interactive first-time setup (account + VM)
 vmvpn vpn-connect      # connect (auto-starts the VM and proxies)
 vmvpn firefox          # browse through the VPN
 vmvpn vpn-disconnect   # disconnect
+vmvpn ui               # open the app window (starts the tray too)
 ```
 
 That's it! Firefox opens with a dedicated `vmvpn` profile that routes all
@@ -147,7 +148,14 @@ curl -fsSL https://raw.githubusercontent.com/carrerfe/vm-vpn/main/install.sh | b
 Installs to `~/.local/bin` (override with `VMVPN_INSTALL_DIR`). Useful
 environment flags: `VMVPN_SKIP_DEPS=1` (skip the package check),
 `VMVPN_ASSUME_YES=1` (never prompt), `VMVPN_NO_LAUNCH=1` (don't open the
-setup window), `VMVPN_LIMA_VERSION` (pin a different Lima release).
+app), `VMVPN_LIMA_VERSION` (pin a different Lima release), and
+`VMVPN_REF` (git ref to install; default `main`). To install a specific
+release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/carrerfe/vm-vpn/v1.1.0/install.sh \
+    | VMVPN_REF=v1.1.0 bash
+```
 
 ## Architecture
 
@@ -232,11 +240,26 @@ eval "$(./vmvpn completion zsh)"
 | `firefox`        | Launch Firefox with VPN proxy profile    |
 | `firefox-profile`| Show Firefox profile info and deletion   |
 
+### UI Commands
+| Command                    | Description                          |
+|----------------------------|--------------------------------------|
+| `ui`                       | Open the app (starts the tray too)   |
+| `ui status\|logs\|settings\|setup` | Open the app on a specific page |
+| `ui stop`                  | Quit the app (window + tray)         |
+| `ui tray [on\|off]`        | Show/hide the tray icon (persistent) |
+| `ui setup-prompt [on\|off]`| Offer the setup assistant at login   |
+| `vm-autostart [on\|off]`   | Start the VM at graphical login      |
+
+The CLI owns the UI state: preferences live in
+`~/.config/vmvpn/ui.json`, autostart entries in `~/.config/autostart/`, and
+the window/tray processes are started and stopped by `vmvpn ui` itself —
+the GUI never writes these files.
+
 ### Other Commands
 | Command            | Description                    |
 |--------------------|--------------------------------|
 | `version`          | Print version (`--version`/`-V`) |
-| `settings`         | Open the GUI settings window   |
+| `settings`         | Alias of `ui settings`         |
 | `completion bash`  | Output bash completion script  |
 | `completion zsh`   | Output zsh completion script   |
 
@@ -255,6 +278,8 @@ eval "$(./vmvpn completion zsh)"
 │   ├── vmvpn-window        # GTK4 + libadwaita window
 │   ├── icons/              # Own full-colour status icons (no theme needed)
 │   └── tests/              # Unit tests (no Gtk needed)
+├── scripts/release.sh      # Release tagging helper
+├── .githooks/pre-push      # Tag/version consistency check
 └── README.md
 ```
 
@@ -340,7 +365,7 @@ vmvpn logs vpn -f                      # stream the VPN connection log
 ```
 
 `status --json` always exits 0 and reports one object:
-`{schema, version, busy, vm{name,exists,status,dir,cpus,memory_bytes,disk_bytes}, vm_config{cpus,memory_mib,disk_gib,swap_mib,swappiness}, vm_pending_restart, guest{mem_total_bytes,mem_used_bytes,mem_available_bytes,swap_total_bytes,swap_used_bytes,squid_active}|null, vpn{state,raw}, proxies{socks{enabled,port,running},http{enabled,port,running}}, config{path,exists,valid,gateway,port,username,password_source}, cert{path,fingerprint}}`.
+`{schema, version, busy, vm{name,exists,status,dir,cpus,memory_bytes,disk_bytes}, vm_config{cpus,memory_mib,disk_gib,swap_mib,swappiness}, vm_pending_restart, guest{mem_total_bytes,mem_used_bytes,mem_available_bytes,swap_total_bytes,swap_used_bytes,squid_active}|null, vpn{state,raw}, proxies{socks{enabled,port,running},http{enabled,port,running}}, config{path,exists,valid,reason,gateway,port,username,password_source}, cert{path,fingerprint}, ui{tray_enabled,tray_running,window_running,setup_prompt}, vm_autostart, release{version,ref,commit,source,installed_at}|null}`.
 `vpn.state` is `connected`/`disconnected`/`unknown`; `password_source` is `config`/`keyring`/`none` (the password itself is never printed).
 `busy` is `true` while another `vmvpn` process holds the operation lock.
 `vm_pending_restart` is `true` when the instance's cpus/memory/disk differ
@@ -371,7 +396,18 @@ operation lock above).
 
 ## Desktop GUI (GNOME / KDE)
 
-Two GUI front-ends drive the CLI without a terminal:
+The app is a single component managed through `vmvpn ui` — it consists of a
+tray icon and a window, both started/stopped and configured by the CLI:
+
+- **`vmvpn ui`** opens the window (and starts the tray icon when enabled).
+- **`vmvpn ui tray on|off`** shows/hides the tray icon, now and at login.
+- **`vmvpn ui setup-prompt on|off`** controls whether the app proposes the
+  setup assistant at login while the VPN isn't configured (the assistant's
+  "Don't show this again" checkbox drives the same preference).
+- **`vmvpn vm-autostart on|off`** starts the VM at graphical login (needs an
+  existing VM).
+
+Internals — two GUI processes drive the CLI without a terminal:
 
 - **`vmvpn-tray`** — a tray icon (StatusNotifierItem) with its own
   full-colour status icons (no icon theme needed). The menu shows the state
@@ -382,7 +418,7 @@ Two GUI front-ends drive the CLI without a terminal:
 - **`vmvpn-window`** — a GTK4/libadwaita window (also in the app grid as
   "VM VPN"). On first run (no VPN profile) it opens a **setup assistant**:
   system check → VPN account → create the VM → connect. It's also reachable
-  via `vmvpn-window --page setup`, "Set up VPN…" on the Status page, and
+  via `vmvpn ui setup`, "Set up VPN…" on the Status page, and
   "Run setup assistant" in Settings. Pages:
   - **Status**: VM name/state/CPUs/memory/disk, guest memory + swap bars,
     Squid state, VPN state with Connect/Disconnect, proxy cards with copy
@@ -398,9 +434,9 @@ Two GUI front-ends drive the CLI without a terminal:
     with Apply/Revert and a keyring password store. A Maintenance group
     offers "Abort running operation", "Force stop VM" and "Delete VM".
 
-`vmvpn settings` opens the window on the Settings page; the window also
-accepts `--page status|logs|settings|setup` (a second invocation reuses the
-running instance).
+`vmvpn ui settings` (or the `vmvpn settings` alias) opens the window on the
+Settings page; `vmvpn ui status|logs|settings|setup` opens the other pages
+(a second invocation reuses the running window).
 
 Password dialogs offer "Remember in GNOME keyring"; when the server
 certificate is new or changed you get a trust dialog showing the fingerprint
@@ -449,10 +485,13 @@ The installer checks these and prints hints; the CLI works without them.
 ### Uninstalling the GUI
 
 ```bash
-rm -f ~/.local/bin/vmvpn-tray ~/.local/bin/vmvpn-window
+vmvpn ui stop                                 # quit the app
+vmvpn ui tray off; vmvpn vm-autostart off     # remove autostart entries
 rm -rf ~/.local/bin/vmvpn-gui
 rm -f ~/.local/share/applications/io.github.carrerfe.VmVpn.desktop
-rm -f ~/.config/autostart/vmvpn-tray.desktop   # if "Start at login" was on
+rm -f ~/.config/autostart/vmvpn-tray.desktop ~/.config/autostart/vmvpn-vm.desktop
+rm -rf ~/.config/vmvpn                        # ui.json preferences
+rm -f ~/.local/state/vmvpn/ui.log ~/.local/state/vmvpn/gui.log
 ```
 
 ### Manual Connection (Inside VM)
@@ -535,6 +574,25 @@ CPU/memory/disk changes require a restart — run `vmvpn vm-apply` (it refuses
 to shrink the disk, and only restarts when a managed key differs).
 `status --json` reports the managed values in `vm_config` (null = unmanaged)
 and flags pending resource changes with `vm_pending_restart`.
+
+## Releasing
+
+`scripts/release.sh X.Y.Z` bumps `VMVPN_VERSION` (in `vmvpn`) and `VERSION`
+(in `gui/vmvpn_common.py`), runs the unit tests, commits `release: vX.Y.Z`
+and creates the annotated tag `vX.Y.Z`. It requires a clean tree and a
+version ≥ the latest reachable `v*` tag. It never pushes; it prints the
+push commands (`origin` and `gitlab`).
+
+A `pre-push` hook rejects a `vX.Y.Z` tag whose commit doesn't carry that
+version in `VMVPN_VERSION`. Enable it once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Installs record where they came from in `vmvpn-gui/release.json`
+(version, git ref, commit, install date); `vmvpn --version` and
+`vmvpn status --json` expose it.
 
 ## License
 

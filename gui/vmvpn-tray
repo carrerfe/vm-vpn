@@ -2,7 +2,6 @@
 """vmvpn tray icon - GTK3 + AyatanaAppIndicator3 (SNI, works on GNOME/KDE)."""
 
 import os
-import shutil
 import signal
 import subprocess
 import sys
@@ -80,6 +79,11 @@ class TrayApp:
         self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
         self.indicator.set_title("VM VPN")
         app.hold()
+        # Expose a "quit" application action so `vmvpn ui stop` can shut the
+        # tray down over D-Bus (org.freedesktop.Application.ActivateAction).
+        quit_action = Gio.SimpleAction.new("quit", None)
+        quit_action.connect("activate", self._quit)
+        app.add_action(quit_action)
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, self._quit)
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, self._quit)
         self._refresh_ui()
@@ -212,10 +216,9 @@ class TrayApp:
         return item
 
     def _window_path(self):
-        sibling = os.path.join(SCRIPT_DIR, "vmvpn-window")
-        if os.path.isfile(sibling) and os.access(sibling, os.X_OK):
-            return sibling
-        return shutil.which("vmvpn-window")
+        # The CLI owns launching the window (vmvpn ui <page>); this only
+        # reports whether a UI is available for menu sensitivity.
+        return vc.find_cli()
 
     def _menu_signature(self):
         """Tuple describing the menu model; rebuild only when it changes."""
@@ -371,17 +374,18 @@ class TrayApp:
         self._open_window("setup")
 
     def _open_window(self, page):
-        win = self._window_path()
-        if win is not None:
-            self._spawn_detached(win, "--page", page)
+        # Single launch path: the CLI starts/presents the window.
+        vc.open_ui(page)
 
     def _on_about(self, *_args):
         dialog = Gtk.AboutDialog()
         dialog.set_program_name("VM VPN")
         dialog.set_version(vc.VERSION)
+        comments = vc.release_line()
         cli_version = (self.status or {}).get("version")
         if cli_version and cli_version != vc.VERSION:
-            dialog.set_comments("CLI %s" % cli_version)
+            comments += "\nCLI reports %s" % cli_version
+        dialog.set_comments(comments)
         dialog.set_website("https://github.com/carrerfe/vm-vpn")
         dialog.set_license_type(Gtk.License.MIT_X11)
         dialog.connect("response", lambda d, *_: d.destroy())
@@ -413,20 +417,6 @@ class TrayApp:
         vc.run_cli(
             args, done, on_line=self._on_action_line if stream else None
         )
-
-    @staticmethod
-    def _spawn_detached(path, *args):
-        try:
-            subprocess.Popen(
-                [path, *args],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-                close_fds=True,
-            )
-        except OSError:
-            pass
 
     # -- dialogs -------------------------------------------------------------------
 
@@ -597,10 +587,34 @@ class TrayApp:
         self._quit()
 
 
+_USAGE = """vmvpn-tray — internal component of VM VPN (tray icon).
+Do not run it directly; manage the app through the CLI:
+
+  vmvpn ui               open the app
+  vmvpn ui tray on|off   show/hide the tray icon
+  vmvpn ui stop          quit the app
+
+Options:
+  -h, --help      show this message
+  -V, --version   print the version
+"""
+
+
 def main():
-    if any(a in ("--version", "-V") for a in sys.argv[1:]):
+    args = sys.argv[1:]
+    if any(a in ("--help", "-h") for a in args):
+        print(_USAGE, end="")
+        return 0
+    if any(a in ("--version", "-V") for a in args):
         print("vmvpn-tray %s" % vc.VERSION)
         return 0
+    if args:
+        sys.stderr.write(
+            "vmvpn-tray: unknown option: %s\n" % args[0]
+            + "vmvpn-tray is an internal component of VM VPN —"
+            " use 'vmvpn ui' instead.\n"
+        )
+        return 2
     app = TrayApp()
     return app.app.run([sys.argv[0]])
 
