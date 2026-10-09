@@ -630,11 +630,18 @@ expect {
 "
     echo "$edit_script" | limactl shell "$VM_NAME" -- expect -f - >/dev/null 2>&1
 
+    # Fingerprints that can be accepted in the first attempt, avoiding a
+    # disconnect/reconnect cycle that FortiClient may reject as "already running"
+    local saved_fp="" esc_trusted
+    [[ -f "$CERT_FINGERPRINT_FILE" ]] && saved_fp=$(cat "$CERT_FINGERPRINT_FILE")
+    esc_trusted=$(tcl_escape "$saved_fp $trust_fingerprint")
+
     # First attempt to connect and capture certificate info
     local connect_output
     local connect_script="
 set timeout 60
 log_user 1
+set trusted \"${esc_trusted}\"
 spawn /opt/forticlient/forticlient-cli vpn connect vpn-tunnel --user=${esc_username} -p
 expect {
     \"Password:\" {
@@ -651,6 +658,11 @@ expect {
         exp_continue
     }
     \"Confirm (y/n)\" {
+        if {[info exists fingerprint] && [lsearch -exact \$trusted \$fingerprint] >= 0} {
+            puts \"CERT_ACCEPTED::\"
+            send -- \"y\r\"
+            exp_continue
+        }
         send -- \"n\r\"
     }
     eof
@@ -672,8 +684,11 @@ expect {
             exit "$cert_rc"
         fi
 
+    fi
+
+    if [[ -n "$cert_fingerprint" ]] && ! grep -q 'CERT_ACCEPTED::' <<<"$connect_output"; then
         # Disconnect the stuck connection from first attempt before reconnecting
-        limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn disconnect 2>/dev/null || true
+        limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn disconnect >/dev/null 2>&1 || true
 
         # Wait until the tunnel is actually down (up to 15 seconds)
         local max_wait=15
@@ -708,12 +723,15 @@ expect {
     eof
 }
 "
-        connect_output=$(echo "$reconnect_script" | limactl shell "$VM_NAME" -- expect -f - 2>&1)
-        echo "$connect_output"
-    else
-        # No certificate prompt - just show the output
-        echo "$connect_output"
+        # FortiClient can still report the cancelled session as running for a while
+        local attempt
+        for attempt in 1 2 3 4 5; do
+            connect_output=$(echo "$reconnect_script" | limactl shell "$VM_NAME" -- expect -f - 2>&1)
+            grep -q "already running" <<<"$connect_output" || break
+            sleep 3
+        done
     fi
+    sed -E 's/CERT_(FINGERPRINT::[0-9A-Fa-f:]*|ACCEPTED::)//' <<<"$connect_output"
 
     # Check if login failed
     if echo "$connect_output" | grep -q "Login failed"; then
