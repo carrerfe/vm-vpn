@@ -140,10 +140,4 @@ hostResolver:
     host.lima.internal: host.lima.internal
 
 message: |
-  Ubuntu 24.04 LTS VM for FortiClient VPN is ready!
-  
-  To access the VM:
-    limactl shell ubuntu-vpn
-  
-  Or via SSH:
-    ssh -F ~/.lima/ubuntu-vpn/ssh.config lima-ubuntu-vpn
+  The VM VPN virtual machine is ready.

@@ -12,36 +12,74 @@ Fortinet's official Linux VPN client (FortiClient) often lags behind the latest 
 
 **VM VPN solves this** by running FortiClient inside a lightweight Ubuntu 24.04 LTS virtual machine, then exposing the VPN connection to your host through proxy servers. Your browser and applications connect through the proxy — no need to install FortiClient directly on your system.
 
-## Quick Start (5 minutes)
+![VM VPN status page](docs/screenshots/window-status.png)
 
-**Prerequisites:** You need [QEMU](https://www.qemu.org/), [Lima](https://lima-vm.io/) (a lightweight VM manager), and `jq` installed.
+## Quick Start
+
+### 1. Install
 
 ```bash
-# 1. Install dependencies (one-time setup)
-sudo apt install qemu-system jq                    # Install QEMU and jq (Ubuntu/Debian)
-
-VERSION=$(curl -fsSL https://api.github.com/repos/lima-vm/lima/releases/latest | jq -r .tag_name)
-curl -fsSL "https://github.com/lima-vm/lima/releases/download/${VERSION}/lima-${VERSION:1}-$(uname -s)-$(uname -m).tar.gz" | sudo tar Cxzvm /usr/local
-
-# 2. Install vm-vpn
 curl -fsSL https://raw.githubusercontent.com/carrerfe/vm-vpn/main/install.sh | bash
-
-# 3. Configure your VPN credentials
-cp ~/.local/bin/vpn-config.json.example ~/.local/bin/vpn-config.json
-nano ~/.local/bin/vpn-config.json   # Edit with your VPN server and username
-
-# 4. Connect!
-vmvpn vpn-connect
-
-# 5. Browse through the VPN
-vmvpn firefox
 ```
 
-That's it! Firefox will open with a special profile that routes all traffic through the VPN.
+The installer does everything for you: it checks for QEMU and the other
+system packages (and can install them for you — it may ask for your password
+once), installs [Lima](https://lima-vm.io/) into `~/.local` without sudo, and
+puts **VM VPN** in your app grid.
 
-> Prefer a GUI? The installer also sets up **VM VPN** in your app grid
-> (`vmvpn-window`) and a tray icon (`vmvpn-tray`) — see
-> [Desktop GUI](#desktop-gui-gnome--kde).
+### 2. Using the app (recommended)
+
+On a fresh install the **VM VPN** window opens by itself (or open it from
+your apps). The **setup assistant** walks you through:
+
+1. **System check** — verifies QEMU, Lima, KVM access and disk space.
+2. **VPN account** — server, username and password (stored in GNOME Keyring).
+3. **Create the VM** — a one-time step that downloads ~600 MB and takes
+   5–15 minutes; progress is shown live.
+4. **Connect** — done. Use **Launch VPN Firefox** to browse through the VPN.
+
+<p>
+  <img src="docs/screenshots/assistant-1-welcome.png" width="340" alt="Setup assistant — welcome and system check">
+  <img src="docs/screenshots/assistant-2-account.png" width="340" alt="Setup assistant — VPN account">
+</p>
+<p>
+  <img src="docs/screenshots/assistant-3-vm-progress.png" width="340" alt="Setup assistant — creating the VM">
+  <img src="docs/screenshots/assistant-4-done.png" width="340" alt="Setup assistant — done">
+</p>
+
+The tray icon shows the state and offers Connect/Disconnect, VPN Firefox and
+Settings.
+
+### 3. Using the terminal
+
+```bash
+vmvpn setup            # interactive first-time setup (account + VM)
+vmvpn vpn-connect      # connect (auto-starts the VM and proxies)
+vmvpn firefox          # browse through the VPN
+vmvpn vpn-disconnect   # disconnect
+```
+
+That's it! Firefox opens with a dedicated `vmvpn` profile that routes all
+traffic through the VPN — your regular browser is unaffected.
+
+## Troubleshooting
+
+- **"VM will be very slow" / /dev/kvm errors** — add yourself to the `kvm`
+  group: `sudo usermod -aG kvm $USER`, then log out and back in.
+- **No tray icon on GNOME** — GNOME needs an AppIndicator extension
+  (enabled by default on Ubuntu; Fedora:
+  `sudo dnf install gnome-shell-extension-appindicator`). The window works
+  without it.
+- **Certificate prompt** — on the first connect, check the fingerprint shown
+  against what your IT gave you, then trust it.
+- **Login failed** — your password is wrong or expired; update it in the
+  window (Settings) or run `vmvpn setup` again.
+- **"Another vmvpn operation is in progress"** — a previous run is stuck;
+  run `vmvpn abort` (or use the Abort button / Settings → Maintenance).
+- **VM is stuck** — `vmvpn stop --force` (or Settings → Force stop VM).
+- **See what's happening** — `vmvpn logs vpn` for the VPN log inside the VM,
+  `vmvpn logs journal` for the guest system log, or the window's Logs page.
+  GUI activity is in `~/.local/state/vmvpn/gui.log`.
 
 ## How It Works
 
@@ -60,47 +98,56 @@ Your regular Firefox and other apps remain unaffected — only the dedicated VPN
 - **SOCKS5 & HTTP proxies**: Use with any application
 - **Simple CLI**: `vpn-connect`, `vpn-disconnect`, `vpn-status`
 
-## Installation (Alternative)
+## Manual installation
+
+The installer normally handles this for you, but you can install the
+dependencies by hand.
+
+### System packages
+
+**Ubuntu/Debian (x86_64):**
+```bash
+sudo apt install qemu-system-x86 qemu-utils ovmf jq openssh-client curl
+# For the GUI:
+sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-gtk-4.0 gir1.2-adw-1 \
+    gir1.2-ayatanaappindicator3-0.1 gir1.2-notify-0.7 libsecret-tools
+```
+
+**Ubuntu/Debian (aarch64):**
+```bash
+sudo apt install qemu-system-arm qemu-utils qemu-efi-aarch64 jq openssh-client curl
+```
+
+**Fedora:**
+```bash
+sudo dnf install qemu-system-x86 qemu-img edk2-ovmf jq openssh-clients curl
+# For the GUI:
+sudo dnf install python3-gobject gtk3 gtk4 libadwaita \
+    libayatana-appindicator-gtk3 libnotify libsecret
+```
+
+### Lima
+
+If `limactl` is missing the installer downloads a pinned release (2.0.3)
+into `~/.local` without sudo. To install it manually:
+
+```bash
+VERSION=2.0.3
+curl -fsSL "https://github.com/lima-vm/lima/releases/download/v${VERSION}/lima-${VERSION}-$(uname -s)-$(uname -m).tar.gz" -o /tmp/lima.tar.gz
+tar -xzf /tmp/lima.tar.gz -C /tmp
+cp -R /tmp/bin /tmp/share ~/.local/   # puts limactl in ~/.local/bin
+```
+
+### Installer options
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/carrerfe/vm-vpn/main/install.sh | bash
 ```
 
-This installs to `~/.local/bin`. Set `VMVPN_INSTALL_DIR` to customize.
-
-## Requirements
-
-- [QEMU](https://www.qemu.org/) - required VM backend for Lima
-- [Lima](https://lima-vm.io/) - lightweight Linux virtual machines on Linux/macOS
-- jq (for JSON config parsing)
-
-### Install Dependencies
-
-**Linux (Ubuntu/Debian):**
-```bash
-# 1. Install QEMU and jq
-sudo apt install qemu-system jq
-
-# 2. Install Lima (binary from GitHub releases)
-VERSION=$(curl -fsSL https://api.github.com/repos/lima-vm/lima/releases/latest | jq -r .tag_name)
-curl -fsSL "https://github.com/lima-vm/lima/releases/download/${VERSION}/lima-${VERSION:1}-$(uname -s)-$(uname -m).tar.gz" | sudo tar Cxzvm /usr/local
-```
-
-**Linux (Fedora/RHEL):**
-```bash
-# 1. Install QEMU and jq
-sudo dnf install qemu-system-x86 jq
-
-# 2. Install Lima (binary from GitHub releases)
-VERSION=$(curl -fsSL https://api.github.com/repos/lima-vm/lima/releases/latest | jq -r .tag_name)
-curl -fsSL "https://github.com/lima-vm/lima/releases/download/${VERSION}/lima-${VERSION:1}-$(uname -s)-$(uname -m).tar.gz" | sudo tar Cxzvm /usr/local
-```
-
-**macOS:**
-```bash
-brew install lima jq
-# QEMU is installed automatically by Homebrew as a Lima dependency
-```
+Installs to `~/.local/bin` (override with `VMVPN_INSTALL_DIR`). Useful
+environment flags: `VMVPN_SKIP_DEPS=1` (skip the package check),
+`VMVPN_ASSUME_YES=1` (never prompt), `VMVPN_NO_LAUNCH=1` (don't open the
+setup window), `VMVPN_LIMA_VERSION` (pin a different Lima release).
 
 ## Architecture
 
@@ -142,26 +189,6 @@ brew install lima jq
 
 **HTTP Proxy**: Squid running inside the VM. Useful for apps that only support HTTP proxies or environment variables.
 
-## Quick Start
-
-```bash
-# 1. Create your VPN config
-cp vpn-config.json.example vpn-config.json
-# Edit vpn-config.json with your credentials
-
-# 2. Connect to VPN (auto-starts VM and proxies)
-./vmvpn vpn-connect
-
-# 3. Launch Firefox with VPN proxy
-./vmvpn firefox
-
-# 4. Check status
-./vmvpn vpn-status
-
-# 5. Disconnect when done
-./vmvpn vpn-disconnect
-```
-
 ## Shell Completion
 
 ```bash
@@ -177,6 +204,7 @@ eval "$(./vmvpn completion zsh)"
 ### VM Commands
 | Command          | Description                              |
 |------------------|------------------------------------------|
+| `setup`          | Interactive first-time setup (account + VM) |
 | `start`          | Create and start the VM                  |
 | `stop [-f]`      | Stop the VM (`-f`: abort stuck ops, force stop) |
 | `restart`        | Restart the VM                           |
@@ -352,11 +380,15 @@ Two GUI front-ends drive the CLI without a terminal:
   also shows desktop notifications (connect, disconnect, login failed,
   certificate rejected, VPN connection lost, keyring-save failures).
 - **`vmvpn-window`** — a GTK4/libadwaita window (also in the app grid as
-  "VM VPN") with three pages:
+  "VM VPN"). On first run (no VPN profile) it opens a **setup assistant**:
+  system check → VPN account → create the VM → connect. It's also reachable
+  via `vmvpn-window --page setup`, "Set up VPN…" on the Status page, and
+  "Run setup assistant" in Settings. Pages:
   - **Status**: VM name/state/CPUs/memory/disk, guest memory + swap bars,
     Squid state, VPN state with Connect/Disconnect, proxy cards with copy
     buttons, Firefox launch, config/cert info, and an Abort button while an
-    operation is running.
+    operation is running. Long operations (VM creation, connecting) show a
+    live phase line, elapsed time and a "Details" expander.
   - **Logs**: "VPN (live)", FortiClient, Squid and guest journal streams
     (`vmvpn logs -f`, restarted/stopped automatically with the VM), plus GUI
     activity and Lima host logs — with a Follow toggle, copy, and
@@ -367,7 +399,7 @@ Two GUI front-ends drive the CLI without a terminal:
     offers "Abort running operation", "Force stop VM" and "Delete VM".
 
 `vmvpn settings` opens the window on the Settings page; the window also
-accepts `--page status|logs|settings` (a second invocation reuses the
+accepts `--page status|logs|settings|setup` (a second invocation reuses the
 running instance).
 
 Password dialogs offer "Remember in GNOME keyring"; when the server
@@ -388,6 +420,9 @@ Both processes poll `vmvpn status --json`, respect the CLI operation lock
 
 ![Status page — VPN connected](docs/screenshots/window-status.png)
 *Status page while connected — VPN state, proxy endpoints, VM details.*
+
+![Status page — VM not created](docs/screenshots/window-create-vm.png)
+*Status page on a fresh setup — the **Create VM** button removes the dead end.*
 
 ![Logs page](docs/screenshots/window-logs.png)
 *Logs page tailing the guest FortiClient log.*
@@ -479,13 +514,9 @@ This creates a dedicated `vmvpn` Firefox profile with proxy settings matching yo
 
 ## Customization
 
-Edit `vmvpn.yaml` to customize:
-
-```yaml
-cpus: 2          # Number of CPUs
-memory: "512MiB" # RAM allocation
-disk: "20GiB"    # Disk size
-```
+VM resources are configured in the `vm` block of `vpn-config.json` (see
+below) or from the window's Settings page ("Virtual machine" group →
+"Apply to VM"). You do not normally need to edit `vmvpn.yaml`.
 
 ### Guest swap and VM resources
 

@@ -377,6 +377,48 @@ class TestRunCliAndLog(FlowTestCase):
         self.assertEqual(result["out"], "")
         self.assertIn("CLI not found", result["err"])
 
+    def test_run_cli_on_line_streams_and_collects(self):
+        """on_line gets each line live; callback still gets full output."""
+        self.stub.add_step(
+            rc=0,
+            out="==> Creating the VM…\ndetail one\ndetail two\n",
+            err="warn line\n",
+        )
+        lines = []
+        result = {}
+        vc.run_cli(
+            ["start"],
+            lambda rc, out, err: result.update(rc=rc, out=out, err=err),
+            on_line=lines.append,
+        )
+        drive(lambda: "rc" in result)
+        self.assertEqual(result["rc"], 0)
+        self.assertEqual(
+            result["out"], "==> Creating the VM…\ndetail one\ndetail two\n"
+        )
+        self.assertEqual(result["err"], "warn line\n")
+        self.assertIn("==> Creating the VM…", lines)
+        self.assertIn("warn line", lines)
+        self.assertEqual(len(lines), 4)
+
+    def test_connect_flow_passes_on_line(self):
+        self.stub.add_step(rc=4)
+        self.stub.add_step(
+            rc=0, out="==> Connecting to g:443…\n==> Connected.\n"
+        )
+        lines = []
+        flow = vc.ConnectFlow(
+            lambda msg, cb: cb("pw", False),
+            lambda n, s, cb: cb(False),
+            self._on_done,
+            on_line=lines.append,
+        )
+        flow.start()
+        drive(lambda: self.done is not None)
+        self.assertEqual(self.done[0], 0)
+        self.assertIn("==> Connecting to g:443…", lines)
+        self.assertIn("==> Connected.", lines)
+
     def test_log_false_writes_nothing(self):
         self.stub.add_step(rc=0, out='{"schema":1}\n')
         result = {}
@@ -537,6 +579,126 @@ class TestConfigHelpers(FlowTestCase):
         del cfg["password"]
         vc.save_config(path, cfg)
         self.assertNotIn("password", vc.load_config(path))
+
+    def test_save_preserves_existing_file_mode(self):
+        path = self._cfg_path()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{}")
+        os.chmod(path, 0o640)
+        vc.save_config(path, {"a": 1})
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o640)
+
+
+class TestPlaceholders(unittest.TestCase):
+    """Example values in vpn-config.json.example mean "not set up"."""
+
+    def test_placeholder_values_detected(self):
+        self.assertTrue(vc.is_placeholder("vpn.example.com"))
+        self.assertTrue(vc.is_placeholder("your-username"))
+
+    def test_real_values_not_placeholders(self):
+        for v in ("gw.corp.example", "jdoe", "", None, "vpn.example.org"):
+            self.assertFalse(vc.is_placeholder(v), "value %r" % v)
+
+    def _cli_path(self):
+        return os.path.realpath(
+            os.path.join(os.path.dirname(vc.__file__), "..", "vmvpn")
+        )
+
+    def _placeholder_config(self, tmp):
+        path = os.path.join(tmp, "vpn-config.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(
+                {"gateway": "vpn.example.com", "port": 443,
+                 "username": "your-username"},
+                f,
+            )
+        return path
+
+    def test_cli_status_json_marks_placeholder_config_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._placeholder_config(tmp)
+            env = dict(
+                os.environ,
+                VPN_CONFIG=cfg,
+                VMVPN_VM_NAME="vmvpn-unittest-nonexistent",
+            )
+            out = subprocess.run(
+                [self._cli_path(), "status", "--json"],
+                capture_output=True, text=True, timeout=60, env=env,
+            )
+            self.assertEqual(out.returncode, 0, out.stderr)
+            status = json.loads(out.stdout)
+            self.assertTrue(status["config"]["exists"])
+            self.assertFalse(status["config"]["valid"])
+            self.assertEqual(
+                status["config"]["reason"], "placeholder values"
+            )
+
+    def test_cli_rejects_placeholder_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = self._placeholder_config(tmp)
+            env = dict(
+                os.environ,
+                VPN_CONFIG=cfg,
+                VMVPN_VM_NAME="vmvpn-unittest-nonexistent",
+            )
+            out = subprocess.run(
+                [self._cli_path(), "vpn-status"],
+                capture_output=True, text=True, timeout=30,
+                stdin=subprocess.DEVNULL, env=env,
+            )
+            self.assertEqual(out.returncode, 5)
+            self.assertIn("placeholder", out.stderr)
+            self.assertIn("vmvpn setup", out.stderr)
+
+
+class TestHostPortParsing(unittest.TestCase):
+    def test_plain_host(self):
+        self.assertEqual(vc.parse_host_port("vpn.example.com"),
+                         ("vpn.example.com", 443))
+
+    def test_host_port(self):
+        self.assertEqual(vc.parse_host_port("vpn.example.com:8443"),
+                         ("vpn.example.com", 8443))
+
+    def test_url(self):
+        self.assertEqual(
+            vc.parse_host_port("https://vpn.example.com:10443/sslvpn"),
+            ("vpn.example.com", 10443),
+        )
+        self.assertEqual(
+            vc.parse_host_port("https://vpn.example.com/path"),
+            ("vpn.example.com", 443),
+        )
+
+    def test_custom_default_port(self):
+        self.assertEqual(vc.parse_host_port("h", 1234), ("h", 1234))
+
+    def test_invalid(self):
+        for bad in ("", "   ", "host name", None):
+            self.assertEqual(
+                vc.parse_host_port(bad)[0], None, "input %r" % bad
+            )
+
+
+class TestFindFreePort(unittest.TestCase):
+    def test_free_port_returned(self):
+        port = vc.find_free_port(39000)
+        self.assertGreaterEqual(port, 39000)
+
+    def test_skips_busy_port(self):
+        import socket
+
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        busy = s.getsockname()[1]
+        try:
+            port = vc.find_free_port(busy)
+            self.assertNotEqual(port, busy)
+        finally:
+            s.close()
 
 
 class TestVersion(FlowTestCase):

@@ -49,6 +49,34 @@ def _last_line(text):
     return ""
 
 
+def _readable_error(stdout, stderr):
+    """Pick a human-readable error line from CLI output.
+
+    First pass prefers the specific 'Could not reach…' line the CLI emits;
+    second pass takes the last 'Could not …'/'Error…'/'failed' line so
+    generic trailing noise like FortiClient's 'DONE.' is skipped.
+    """
+    for text in (stderr, stdout):
+        for line in reversed((text or "").splitlines()):
+            line = line.strip()
+            if "check the address" in line.lower() \
+                    or line.lower().startswith("could not reach"):
+                return line
+    for text in (stderr, stdout):
+        for line in reversed((text or "").splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            low = line.lower()
+            if (
+                low.startswith("could not")
+                or low.startswith("error")
+                or "failed" in low
+            ):
+                return line
+    return _last_line(stderr) or _last_line(stdout)
+
+
 def _escape(text):
     return GLib.markup_escape_text(text or "")
 
@@ -66,6 +94,9 @@ class StatusPage(Gtk.Box):
         self.icon = Gtk.Image.new_from_file(_icon_file(ICON_DISABLED))
         self.icon.set_pixel_size(48)
         header.append(self.icon)
+        self.spinner = Gtk.Spinner(valign=Gtk.Align.CENTER)
+        self.spinner.set_visible(False)
+        header.append(self.spinner)
         text_box = Gtk.Box(
             orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER
         )
@@ -73,9 +104,23 @@ class StatusPage(Gtk.Box):
         self.title_label.add_css_class("title-1")
         self.subtitle_label = Gtk.Label(xalign=0.0)
         self.subtitle_label.add_css_class("dim-label")
+        self.phase_label = Gtk.Label(xalign=0.0)
+        self.phase_label.add_css_class("dim-label")
         text_box.append(self.title_label)
         text_box.append(self.subtitle_label)
+        text_box.append(self.phase_label)
         header.append(text_box)
+        self.setup_btn = Gtk.Button(
+            label="Set up VPN…",
+            valign=Gtk.Align.CENTER,
+            tooltip_text="Run the setup assistant",
+        )
+        self.setup_btn.add_css_class("suggested-action")
+        self.setup_btn.set_visible(False)
+        self.setup_btn.connect(
+            "clicked", lambda *_: self.win.open_assistant()
+        )
+        header.append(self.setup_btn)
         self.abort_btn = Gtk.Button(
             label="Abort",
             valign=Gtk.Align.CENTER,
@@ -138,6 +183,29 @@ class StatusPage(Gtk.Box):
         self.firefox_row.add_suffix(self.firefox_btn)
         vpn_group.add(self.firefox_row)
 
+        # Progress: visible while a long operation (connect/create/apply)
+        # is running; shows the latest '==> ' phase line plus raw details.
+        self.progress_row = Adw.ExpanderRow(title="Details", expanded=False)
+        self.progress_view = Gtk.TextView(
+            editable=False,
+            monospace=True,
+            wrap_mode=Gtk.WrapMode.WORD_CHAR,
+            top_margin=6,
+            bottom_margin=6,
+            left_margin=12,
+            right_margin=12,
+        )
+        self.progress_view.set_size_request(-1, 140)
+        self.progress_scroll = Gtk.ScrolledWindow(
+            child=self.progress_view, propagate_natural_height=True
+        )
+        progress_inner = Gtk.ListBoxRow()
+        progress_inner.set_activatable(False)
+        progress_inner.set_child(self.progress_scroll)
+        self.progress_row.add_row(progress_inner)
+        self.progress_row.set_visible(False)
+        vpn_group.add(self.progress_row)
+
         self.raw_expander = Adw.ExpanderRow(title="Raw VPN status")
         self.raw_label = Gtk.Label(xalign=0.0)
         self.raw_label.set_margin_top(6)
@@ -195,13 +263,19 @@ class StatusPage(Gtk.Box):
         self.btn_start.add_css_class("suggested-action")
         self.btn_stop.add_css_class("destructive-action")
         self.btn_start.connect(
-            "clicked", lambda *_: self.win.run_action("Start VM", ["start"])
+            "clicked",
+            lambda *_: self.win.run_action(
+                "Start VM", ["start"], stream=True
+            ),
         )
         self.btn_stop.connect(
             "clicked", lambda *_: self.win.run_action("Stop VM", ["stop"])
         )
         self.btn_restart.connect(
-            "clicked", lambda *_: self.win.run_action("Restart VM", ["restart"])
+            "clicked",
+            lambda *_: self.win.run_action(
+                "Restart VM", ["restart"], stream=True
+            ),
         )
         power_box.append(self.btn_start)
         power_box.append(self.btn_stop)
@@ -251,6 +325,7 @@ class StatusPage(Gtk.Box):
         config_valid = bool(cfg.get("exists") and cfg.get("valid"))
 
         # Header ------------------------------------------------------------
+        progress = self.win.progress
         if action == "connect":
             title, sub, icon = "Connecting…", "Hold on", ICON_ACQUIRING
         elif busy:
@@ -279,6 +354,36 @@ class StatusPage(Gtk.Box):
         self.subtitle_label.set_label(sub)
         self.subtitle_label.set_visible(bool(sub))
 
+        # Progress: spinner + latest "==> " phase + elapsed time.
+        if progress is not None:
+            elapsed = max(0, int(time.monotonic() - progress["started"]))
+            phase = progress.get("phase") or progress.get("label") or ""
+            self.phase_label.set_label(
+                "%s  %02d:%02d" % (phase, elapsed // 60, elapsed % 60)
+            )
+            self.phase_label.set_visible(True)
+            self.spinner.start()
+            self.spinner.set_visible(True)
+        else:
+            self.phase_label.set_label("")
+            self.phase_label.set_visible(False)
+            self.spinner.stop()
+            self.spinner.set_visible(False)
+        lines = progress["lines"] if progress is not None else None
+        self.progress_row.set_visible(bool(lines))
+        if lines:
+            self.progress_view.get_buffer().set_text(
+                "\n".join(list(lines)[-200:])
+            )
+            adj = self.progress_scroll.get_vadjustment()
+            adj.set_value(adj.get_upper() - adj.get_page_size())
+
+        # Dead-end recovery: a primary "Set up VPN…" when there is no usable
+        # config; the button in the VM row handles a missing VM.
+        self.setup_btn.set_visible(
+            status is not None and not config_valid and not busy
+        )
+
         # VPN group ----------------------------------------------------------
         self.row_state.set_subtitle(
             {
@@ -296,9 +401,8 @@ class StatusPage(Gtk.Box):
             self.conn_button.set_label("Connect")
             self.conn_button.remove_css_class("destructive-action")
             self.conn_button.add_css_class("suggested-action")
-            self.conn_button.set_sensitive(
-                not busy and config_valid and vm_running
-            )
+            # vpn-connect starts (or creates) the VM itself.
+            self.conn_button.set_sensitive(not busy and config_valid)
         self.row_gateway.set_subtitle(str(cfg.get("gateway") or "—"))
         self.row_username.set_subtitle(str(cfg.get("username") or "—"))
 
@@ -308,6 +412,9 @@ class StatusPage(Gtk.Box):
         self._proxy_row(self.row_http, self.http_copy, http)
 
         self.firefox_btn.set_sensitive(not busy and connected)
+        self.firefox_btn.set_tooltip_text(
+            "" if connected else "Connect first"
+        )
 
         raw = vpn.get("raw") or ""
         self.raw_label.set_markup(
@@ -349,7 +456,15 @@ class StatusPage(Gtk.Box):
             )
 
         exists = bool(vm.get("exists"))
-        self.btn_start.set_sensitive(not busy and exists and not vm_running)
+        self.btn_start.set_label("Start" if exists else "Create VM")
+        self.btn_start.set_sensitive(
+            not busy and not vm_running and (exists or config_valid)
+        )
+        self.btn_start.set_tooltip_text(
+            ""
+            if (exists or config_valid)
+            else "Set up the VPN account first"
+        )
         self.btn_stop.set_sensitive(not busy and vm_running)
         self.btn_restart.set_sensitive(not busy and vm_running)
 
@@ -961,6 +1076,18 @@ class SettingsPage(Gtk.Box):
         self.startup_row.set_active(vc.autostart_enabled())
         self.startup_row.connect("notify::active", self._on_startup_toggled)
         start_group.add(self.startup_row)
+        setup_row = Adw.ActionRow(
+            title="Setup assistant",
+            subtitle="Configure the VPN account and create the VM",
+        )
+        setup_btn = Gtk.Button(
+            label="Run setup assistant", valign=Gtk.Align.CENTER
+        )
+        setup_btn.connect(
+            "clicked", lambda *_: self.win.open_assistant()
+        )
+        setup_row.add_suffix(setup_btn)
+        start_group.add(setup_row)
         page.add(start_group)
 
         # Virtual machine ---------------------------------------------------------
@@ -1182,9 +1309,16 @@ class SettingsPage(Gtk.Box):
     def _fill(self):
         self._filling = True
         cfg = self.cfg or {}
-        self.gw_row.set_text(str(cfg.get("gateway") or ""))
+        gateway = cfg.get("gateway") or ""
+        username = cfg.get("username") or ""
+        # Example placeholder values mean "unset".
+        if vc.is_placeholder(gateway):
+            gateway = ""
+        if vc.is_placeholder(username):
+            username = ""
+        self.gw_row.set_text(str(gateway))
         self.port_row.set_value(float(cfg.get("port") or 443))
-        self.user_row.set_text(str(cfg.get("username") or ""))
+        self.user_row.set_text(str(username))
         socks = cfg.get("socks_proxy") or {}
         http = cfg.get("http_proxy") or {}
         self.socks_enabled.set_active(bool(socks.get("enabled", True)))
@@ -1449,7 +1583,8 @@ class SettingsPage(Gtk.Box):
         )
         if not pending:
             self.win.run_action(
-                "Apply VM settings", ["vm-apply", "-y"], force=True
+                "Apply VM settings", ["vm-apply", "-y"], force=True,
+                stream=True,
             )
             return
         dialog = Adw.AlertDialog(
@@ -1466,7 +1601,8 @@ class SettingsPage(Gtk.Box):
         def on_response(_dlg, response):
             if response == "apply":
                 self.win.run_action(
-                    "Apply VM settings", ["vm-apply", "-y"], force=True
+                    "Apply VM settings", ["vm-apply", "-y"], force=True,
+                    stream=True,
                 )
 
         dialog.connect("response", on_response)
@@ -1495,6 +1631,572 @@ class SettingsPage(Gtk.Box):
         dialog.present(self.get_root())
 
 
+# ---------------------------------------------------------------------------
+# Setup assistant
+# ---------------------------------------------------------------------------
+
+
+def _dep_fix_command():
+    """Package-install command for the detected distro (for copy buttons)."""
+    try:
+        info = {}
+        with open("/etc/os-release", encoding="utf-8") as f:
+            for line in f:
+                k, _, v = line.partition("=")
+                info[k.strip()] = v.strip().strip('"')
+        ids = {info.get("ID", "")} | set(
+            info.get("ID_LIKE", "").split()
+        )
+    except OSError:
+        ids = set()
+    if "fedora" in ids:
+        return (
+            "sudo dnf install qemu-system-x86 qemu-img edk2-ovmf jq "
+            "openssh-clients curl python3-gobject gtk3 gtk4 "
+            "libadwaita libayatana-appindicator-gtk3 libnotify "
+            "libsecret firefox"
+        )
+    if ids & {"debian", "ubuntu"}:
+        import platform
+
+        machine = platform.machine()
+        if machine == "aarch64":
+            qemu = "qemu-system-arm qemu-efi-aarch64"
+        else:
+            qemu = "qemu-system-x86 ovmf"
+        return (
+            "sudo apt install %s qemu-utils jq openssh-client curl "
+            "python3-gi gir1.2-gtk-3.0 gir1.2-gtk-4.0 gir1.2-adw-1 "
+            "gir1.2-ayatanaappindicator3-0.1 gir1.2-notify-0.7 "
+            "libsecret-tools firefox" % qemu
+        )
+    return (
+        "Install Lima, QEMU, jq, Python GObject introspection and the "
+        "GTK/libadwaita bindings with your package manager"
+    )
+
+
+class _CheckRow(Adw.ActionRow):
+    """One system-check row: icon + explanation + optional fix copy."""
+
+    def __init__(self, title, required=True, fix=None):
+        super().__init__(title=title)
+        self.required = required
+        self.fix = fix
+        self.icon = Gtk.Image(valign=Gtk.Align.CENTER)
+        self.add_suffix(self.icon)
+        self.copy_btn = Gtk.Button(
+            icon_name="edit-copy-symbolic",
+            valign=Gtk.Align.CENTER,
+            tooltip_text="Copy the fix command",
+        )
+        self.copy_btn.add_css_class("flat")
+        self.copy_btn.set_visible(False)
+        self.copy_btn.connect("clicked", self._on_copy)
+        self.add_suffix(self.copy_btn)
+        self.ok = None
+
+    def _on_copy(self, *_args):
+        if self.fix:
+            self.get_clipboard().set_text(self.fix)
+            self.set_subtitle("Fix: %s  (copied)" % self.fix)
+
+    def set_state(self, ok, detail=""):
+        self.ok = ok
+        self.icon.set_from_icon_name(
+            "emblem-ok-symbolic" if ok else "dialog-warning-symbolic"
+        )
+        if detail:
+            self.set_subtitle(detail)
+        elif self.fix and not ok:
+            self.set_subtitle("Fix: %s" % self.fix)
+        self.copy_btn.set_visible(bool(self.fix) and not ok)
+
+
+class SetupAssistant(Adw.Window):
+    """Four-page first-run wizard (Adw.NavigationView)."""
+
+    def __init__(self, win):
+        super().__init__(
+            transient_for=win,
+            modal=True,
+            title="Set up VM VPN",
+            default_width=600,
+            default_height=720,
+        )
+        self.win = win
+        self.password = None          # kept in memory for "Connect now"
+        self._pw_save_failed = False
+        self._vm_proc = None
+        self._vm_done_ok = False
+        self.nav = Adw.NavigationView()
+        self.set_content(self.nav)
+        self.nav.push(self._page_welcome())
+
+    # -- helpers ---------------------------------------------------------------
+
+    @staticmethod
+    def _page(title, body, actions=None):
+        """Wrap body in a NavigationPage: header, scrolled clamp, and a
+        persistent bottom bar for the page actions."""
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        toolbar.add_top_bar(header)
+        scroll = Gtk.ScrolledWindow(vexpand=True)
+        clamp = Adw.Clamp(maximum_size=560)
+        clamp.set_child(body)
+        scroll.set_child(clamp)
+        toolbar.set_content(scroll)
+        if actions is not None:
+            toolbar.add_bottom_bar(actions)
+        page = Adw.NavigationPage(child=toolbar)
+        page.set_title(title)
+        return page
+
+    @staticmethod
+    def _actions_box(*widgets):
+        """Bottom action bar: right-aligned buttons with margins."""
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        box.set_halign(Gtk.Align.END)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+        for w in widgets:
+            box.append(w)
+        return box
+
+    def _close(self, *_args):
+        self.close()
+
+    # -- page 1: welcome + system check ----------------------------------------
+
+    def _page_welcome(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+
+        intro = Gtk.Label(
+            xalign=0.0,
+            wrap=True,
+            label=(
+                "VM VPN runs your organisation's VPN client inside a small "
+                "virtual machine, so the host stays clean. This assistant "
+                "checks the system, asks for your VPN account, creates the "
+                "VM once, and connects."
+            ),
+        )
+        intro.add_css_class("dim-label")
+        box.append(intro)
+
+        self.check_group = Adw.PreferencesGroup(title="System check")
+        box.append(self.check_group)
+
+        self.check_rows = []
+
+        again = Gtk.Button(label="Check again")
+        again.connect("clicked", lambda *_: self._populate_checks())
+        self.welcome_next = Gtk.Button(label="Next")
+        self.welcome_next.add_css_class("suggested-action")
+        self.welcome_next.connect(
+            "clicked", lambda *_: self.nav.push(self._page_account())
+        )
+        actions = self._actions_box(again, self.welcome_next)
+
+        self._populate_checks()
+        return self._page("Welcome", box, actions)
+
+    def _populate_checks(self):
+        for row in self.check_rows:
+            self.check_group.remove(row)
+        self.check_rows = []
+
+        import platform
+        import shutil as _shutil
+        import stat as _stat
+
+        machine = platform.machine()
+        qemu_bin = (
+            "qemu-system-aarch64" if machine == "aarch64"
+            else "qemu-system-x86_64"
+        )
+        fix = _dep_fix_command()
+        kvm_ok = os.access("/dev/kvm", os.R_OK | os.W_OK)
+        try:
+            free = _shutil.disk_usage(
+                os.path.expanduser("~")
+            ).free
+            disk_ok = free >= 5 * 1024**3
+            disk_detail = "%s free" % GLib.format_size(free)
+        except OSError:
+            disk_ok = True
+            disk_detail = ""
+
+        checks = [
+            ("Lima (limactl)", _shutil.which("limactl") is not None, True,
+             fix, "Re-run the installer; it installs Lima for you."),
+            ("QEMU (%s)" % qemu_bin, _shutil.which(qemu_bin) is not None,
+             True, fix, "Install the QEMU package."),
+            ("qemu-img", _shutil.which("qemu-img") is not None, True,
+             fix, "Install qemu-utils / qemu-img."),
+            ("/dev/kvm access", kvm_ok, True,
+             'sudo usermod -aG kvm "$USER"',
+             "Required for fast virtualization. After the fix, log out "
+             "and back in."),
+            ("jq", _shutil.which("jq") is not None, True, fix, ""),
+            ("Disk space (≥ 5 GiB)", disk_ok, True, None, disk_detail),
+            ("GNOME Keyring (secret-tool)",
+             vc.secret_tool_available(), False, fix,
+             "Optional — stores your VPN password."),
+            ("Firefox", _shutil.which("firefox") is not None, False,
+             "sudo apt install firefox",
+             "Optional — needed for the VPN browser profile."),
+        ]
+        for title, ok, required, fix, detail in checks:
+            row = _CheckRow(title, required=required, fix=fix)
+            row.set_state(ok, detail)
+            self.check_rows.append(row)
+            self.check_group.add(row)
+        self._update_welcome_next()
+
+    def _update_welcome_next(self):
+        missing = [r for r in self.check_rows if r.required and r.ok is False]
+        self.welcome_next.set_sensitive(not missing)
+
+    # -- page 2: VPN account ----------------------------------------------------
+
+    def _page_account(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+
+        group = Adw.PreferencesGroup(
+            title="VPN account",
+            description="Enter the details your organisation gave you.",
+        )
+        self.acc_server = Adw.EntryRow(title="Server (e.g. vpn.example.com)")
+        self.acc_port = Adw.SpinRow.new_with_range(1, 65535, 1)
+        self.acc_port.set_title("Port")
+        self.acc_port.set_value(443)
+        self.acc_user = Adw.EntryRow(title="Username")
+        self.acc_pass = Adw.PasswordEntryRow(title="Password")
+        group.add(self.acc_server)
+        group.add(self.acc_port)
+        group.add(self.acc_user)
+        group.add(self.acc_pass)
+        self.acc_remember = Adw.SwitchRow(title="Remember password")
+        self.acc_remember.set_active(True)
+        if vc.secret_tool_available():
+            self.acc_remember.set_subtitle("Stored in GNOME Keyring")
+        else:
+            self.acc_remember.set_subtitle(
+                "Keyring unavailable — saved in the config file"
+            )
+        group.add(self.acc_remember)
+        box.append(group)
+
+        self.acc_error = Gtk.Label(xalign=0.0, wrap=True)
+        self.acc_error.add_css_class("error")
+        self.acc_error.set_visible(False)
+        box.append(self.acc_error)
+
+        # Prefill from an existing config when re-running. Example
+        # placeholder values mean "unset" — leave the field empty.
+        cfg = vc.load_config(vc.config_path())
+        if cfg.get("gateway") and not vc.is_placeholder(cfg["gateway"]):
+            self.acc_server.set_text(str(cfg["gateway"]))
+        if cfg.get("port"):
+            try:
+                self.acc_port.set_value(float(cfg["port"]))
+            except (TypeError, ValueError):
+                pass
+        if cfg.get("username") and not vc.is_placeholder(cfg["username"]):
+            self.acc_user.set_text(str(cfg["username"]))
+
+        next_btn = Gtk.Button(label="Next")
+        next_btn.add_css_class("suggested-action")
+        next_btn.connect("clicked", self._on_account_next)
+        actions = self._actions_box(next_btn)
+        return self._page("VPN account", box, actions)
+
+    def _on_account_next(self, *_args):
+        host, port = vc.parse_host_port(
+            self.acc_server.get_text(), int(self.acc_port.get_value())
+        )
+        if host is None:
+            self.acc_error.set_label("Enter a valid server name.")
+            self.acc_error.set_visible(True)
+            return
+        username = self.acc_user.get_text().strip()
+        if not username:
+            self.acc_error.set_label("Enter your username.")
+            self.acc_error.set_visible(True)
+            return
+        self.acc_error.set_visible(False)
+
+        # Merge into the existing config, preserving unknown keys.
+        path = vc.config_path()
+        cfg = vc.load_config(path)
+        cfg["gateway"] = host
+        cfg["port"] = int(port)
+        cfg["username"] = username
+        socks = cfg.get("socks_proxy")
+        if not isinstance(socks, dict):
+            socks = {}
+        socks.update(
+            {"enabled": True, "port": vc.find_free_port(1080),
+             "auto_start": True, "auto_stop": True}
+        )
+        cfg["socks_proxy"] = socks
+        http = cfg.get("http_proxy")
+        if not isinstance(http, dict):
+            http = {}
+        http["enabled"] = False
+        cfg["http_proxy"] = http
+
+        password = self.acc_pass.get_text()
+        self.password = password or None
+        if password:
+            if self.acc_remember.get_active():
+                cfg.pop("password", None)  # keyring instead
+            else:
+                cfg["password"] = password
+        try:
+            vc.save_config(path, cfg)
+        except OSError as exc:
+            self.acc_error.set_label("Could not write config: %s" % exc)
+            self.acc_error.set_visible(True)
+            return
+
+        if (
+            password
+            and self.acc_remember.get_active()
+            and vc.secret_tool_available()
+            and not self._pw_save_failed
+        ):
+            self._save_password_then_next(path)
+        else:
+            self.nav.push(self._page_vm())
+
+    def _save_password_then_next(self, path):
+        self.acc_error.set_visible(False)
+
+        def done(rc, _out, err):
+            if rc == vc.EXIT_OK:
+                self.nav.push(self._page_vm())
+            else:
+                self.acc_error.set_label(
+                    "Could not save the password to the keyring: %s. "
+                    "Press Next again to continue without saving it — it "
+                    "will only be used for this session's connect."
+                    % (_last_line(err) or "exit %s" % rc)
+                )
+                self.acc_error.set_visible(True)
+                self._pw_save_failed = True
+
+        vc.run_cli(
+            ["password-set", "--stdin"], done,
+            stdin_text=self.acc_pass.get_text() + "\n",
+        )
+
+    # -- page 3: prepare the VM --------------------------------------------------
+
+    def _page_vm(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+
+        group = Adw.PreferencesGroup(title="Virtual machine")
+        self.vm_status_row = Adw.ActionRow(title="Status")
+        group.add(self.vm_status_row)
+        box.append(group)
+
+        info = Gtk.Label(
+            xalign=0.0, wrap=True,
+            label=(
+                "The VM runs the VPN client. Creating it downloads about "
+                "600 MB and takes 5–15 minutes; it only happens once."
+            ),
+        )
+        info.add_css_class("dim-label")
+        box.append(info)
+
+        self.vm_spinner = Gtk.Spinner()
+        self.vm_phase = Gtk.Label(xalign=0.0, wrap=True)
+        self.vm_phase.add_css_class("dim-label")
+        box.append(self.vm_spinner)
+        box.append(self.vm_phase)
+
+        self.vm_details = Gtk.Expander(label="Details")
+        self.vm_details_view = Gtk.TextView(
+            editable=False, monospace=True,
+            wrap_mode=Gtk.WrapMode.WORD_CHAR,
+        )
+        vm_scroll = Gtk.ScrolledWindow(
+            child=self.vm_details_view, propagate_natural_height=True
+        )
+        vm_scroll.set_size_request(-1, 160)
+        self.vm_details.set_child(vm_scroll)
+        box.append(self.vm_details)
+
+        self.vm_error = Gtk.Label(xalign=0.0, wrap=True)
+        self.vm_error.add_css_class("error")
+        self.vm_error.set_visible(False)
+        box.append(self.vm_error)
+
+        self.vm_bg = Gtk.Button(label="Continue in background")
+        self.vm_bg.set_visible(False)
+        self.vm_bg.connect("clicked", self._close)
+        self.vm_abort = Gtk.Button(label="Abort")
+        self.vm_abort.add_css_class("destructive-action")
+        self.vm_abort.set_visible(False)
+        self.vm_abort.connect(
+            "clicked",
+            lambda *_: vc.run_cli(["abort"], lambda *a: None),
+        )
+        self.vm_create = Gtk.Button(label="Create VM")
+        self.vm_create.add_css_class("suggested-action")
+        self.vm_create.connect("clicked", self._on_create_vm)
+        self.vm_next = Gtk.Button(label="Next")
+        self.vm_next.add_css_class("suggested-action")
+        self.vm_next.set_visible(False)
+        self.vm_next.connect(
+            "clicked", lambda *_: self.nav.push(self._page_done())
+        )
+        actions = self._actions_box(
+            self.vm_bg, self.vm_abort, self.vm_create, self.vm_next
+        )
+
+        vm = ((self.win.status or {}).get("vm") or {})
+        if vm.get("exists"):
+            self.vm_status_row.set_subtitle("The VM is ready")
+            self.vm_create.set_visible(False)
+            self.vm_next.set_visible(True)
+        else:
+            self.vm_status_row.set_subtitle("Not created yet")
+        return self._page("Virtual machine", box, actions)
+
+    def _on_create_vm(self, *_args):
+        self.vm_create.set_visible(False)
+        self.vm_error.set_visible(False)
+        self.vm_spinner.start()
+        self.vm_phase.set_label("Starting…")
+        self.vm_bg.set_visible(True)
+        self.vm_abort.set_visible(True)
+        started = time.monotonic()
+
+        # Mirror progress on the main window's status page too.
+        self.win.action_running = True
+        self.win.action = "create"
+        self.win._progress_start("Creating the VM")
+        self.win._apply_status()
+
+        import collections
+
+        lines = collections.deque(maxlen=200)
+
+        def on_line(line):
+            lines.append(line)
+            if line.startswith("==> "):
+                phase = line[4:]
+            else:
+                phase = self.win.progress["phase"]
+            elapsed = int(time.monotonic() - started)
+            self.vm_phase.set_label(
+                "%s  %02d:%02d" % (phase, elapsed // 60, elapsed % 60)
+            )
+            self.vm_details_view.get_buffer().set_text(
+                "\n".join(list(lines)[-200:])
+            )
+            self.win._progress_line(line)
+
+        def done(rc, _out, err):
+            self.vm_spinner.stop()
+            self.vm_abort.set_visible(False)
+            self.win.action_running = False
+            self.win.action = None
+            self.win._progress_stop()
+            self.win._apply_status()
+            self.win._poll()
+            if rc == vc.EXIT_OK:
+                self._vm_done_ok = True
+                self.vm_status_row.set_subtitle("The VM is ready")
+                self.vm_phase.set_label("Done.")
+                self.vm_create.set_visible(False)
+                self.vm_bg.set_visible(False)
+                self.vm_next.set_visible(True)
+            else:
+                self.vm_error.set_label(
+                    "VM creation failed: %s"
+                    % (_last_line(err) or "exit %s" % rc)
+                )
+                self.vm_error.set_visible(True)
+                self.vm_phase.set_label("")
+                self.vm_create.set_label("Retry")
+                self.vm_create.set_sensitive(True)
+                self.vm_create.set_visible(True)
+
+        self._vm_proc = vc.run_cli(["start"], done, on_line=on_line)
+
+    # -- page 4: done -------------------------------------------------------------
+
+    def _page_done(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+
+        group = Adw.PreferencesGroup(title="Done")
+        row = Adw.ActionRow(title="Setup complete")
+        row.set_subtitle(
+            "You can connect now. Everything stays available from the "
+            "VM VPN window and the tray icon."
+        )
+        group.add(row)
+        self.tray_row = Adw.SwitchRow(title="Show the tray icon at login")
+        self.tray_row.set_active(True)
+        group.add(self.tray_row)
+        box.append(group)
+
+        close_btn = Gtk.Button(label="Close")
+        close_btn.connect("clicked", self._close)
+        connect_btn = Gtk.Button(label="Connect now")
+        connect_btn.add_css_class("suggested-action")
+        connect_btn.connect("clicked", self._on_done_connect)
+        actions = self._actions_box(close_btn, connect_btn)
+        return self._page("Done", box, actions)
+
+    def _apply_tray_pref(self):
+        enabled = self.tray_row.get_active()
+        try:
+            vc.set_autostart(enabled, TRAY_PATH)
+        except OSError:
+            pass
+        if enabled:
+            # Start the tray now if it isn't running.
+            try:
+                import subprocess as _sp
+
+                running = _sp.run(
+                    ["pgrep", "-f", "vmvpn-tray"],
+                    capture_output=True,
+                ).returncode == 0
+                if not running and os.access(TRAY_PATH, os.X_OK):
+                    _sp.Popen(
+                        [TRAY_PATH],
+                        stdin=_sp.DEVNULL, stdout=_sp.DEVNULL,
+                        stderr=_sp.DEVNULL,
+                        start_new_session=True,
+                    )
+            except OSError:
+                pass
+
+    def _on_done_connect(self, *_args):
+        self._apply_tray_pref()
+        password, self.password = self.password, None
+        self.close()
+        self.win._start_connect(password=password)
+
+
 class MainWindow(Adw.ApplicationWindow):
     def __init__(self, application):
         super().__init__(
@@ -1509,6 +2211,9 @@ class MainWindow(Adw.ApplicationWindow):
         self.flow = None
         self.poll_in_flight = False
         self.last_failed = False
+        self.progress = None          # dict while a streamed action runs
+        self._assistant = None
+        self._assistant_shown = False
         self._poll_log = vc.StatusPollLogger()
         self._last_refresh = "—"
 
@@ -1557,8 +2262,37 @@ class MainWindow(Adw.ApplicationWindow):
         self._apply_status()
 
     def show_page(self, name):
+        if name == "setup":
+            self.open_assistant()
+            return
         if name in ("status", "logs", "settings"):
             self.stack.set_visible_child_name(name)
+
+    def open_assistant(self):
+        if self._assistant is not None:
+            self._assistant.present()
+            return
+        self._assistant = SetupAssistant(self)
+        self._assistant.connect(
+            "close-request", self._on_assistant_closed
+        )
+        self._assistant.present()
+
+    def _on_assistant_closed(self, *_args):
+        self._assistant = None
+        self.refresh_now()
+        return False
+
+    def _maybe_open_assistant(self):
+        """Open the assistant once on startup when there is no usable config."""
+        if self._assistant_shown or self._assistant is not None:
+            return
+        if self.status is None:
+            return
+        cfg = self._cfg()
+        if not (cfg.get("exists") and cfg.get("valid")):
+            self._assistant_shown = True
+            self.open_assistant()
 
     def _on_close(self, *_args):
         self.logs_page.shutdown()
@@ -1610,19 +2344,58 @@ class MainWindow(Adw.ApplicationWindow):
         )
         self.logs_page.update_status(self.status, busy)
         self.settings_page.update_status(self.status, busy)
+        self._maybe_open_assistant()
+
+    # -- progress (streamed long-running actions) -------------------------------------
+
+    def _progress_start(self, label):
+        import collections
+
+        self.progress = {
+            "label": label,
+            "phase": "",
+            "started": time.monotonic(),
+            "lines": collections.deque(maxlen=200),
+        }
+        GLib.timeout_add(1000, self._progress_tick)
+
+    def _progress_tick(self):
+        if self.progress is None:
+            return GLib.SOURCE_REMOVE
+        # re-render the elapsed clock once a second
+        self.status_page.update(
+            self.status, self._busy(), self.action, self.last_failed
+        )
+        return GLib.SOURCE_CONTINUE
+
+    def _progress_line(self, line):
+        if self.progress is None:
+            return
+        self.progress["lines"].append(line)
+        if line.startswith("==> "):
+            self.progress["phase"] = line[4:]
+        self.status_page.update(
+            self.status, self._busy(), self.action, self.last_failed
+        )
+
+    def _progress_stop(self):
+        self.progress = None
 
     # -- actions -----------------------------------------------------------------------
 
-    def run_action(self, label, args, force=False):
+    def run_action(self, label, args, force=False, stream=False):
         if self._busy() and not force:
             return
         self.action_running = True
         self.action = label
+        if stream:
+            self._progress_start(label)
         self._apply_status()
 
         def done(rc, stdout, stderr):
             self.action_running = False
             self.action = None
+            self._progress_stop()
             if rc == vc.EXIT_BUSY:
                 self.toast("Another vmvpn operation is in progress")
             elif rc == vc.EXIT_OK:
@@ -1630,31 +2403,64 @@ class MainWindow(Adw.ApplicationWindow):
                 self.toast("%s: done" % label)
             else:
                 self.last_failed = True
-                detail = _last_line(stderr) or _last_line(stdout)
+                detail = _readable_error(stdout, stderr)
                 self.toast(
                     "%s failed: %s" % (label, detail or "exit %s" % rc)
                 )
             self._apply_status()
             self._poll()
 
-        vc.run_cli(args, done)
+        vc.run_cli(args, done, on_line=self._progress_line if stream else None)
 
     def _on_connect_clicked(self, *_args):
         if self._busy():
             return
         if ((self.status or {}).get("vpn") or {}).get("state") == "connected":
-            self.run_action("Disconnect", ["vpn-disconnect"])
+            self.run_action("Disconnect", ["vpn-disconnect"], stream=True)
+            return
+        # First connection may need to create the VM (5–15 minutes): say so.
+        vm_exists = bool(
+            ((self.status or {}).get("vm") or {}).get("exists")
+        )
+        if not vm_exists:
+            dialog = Adw.AlertDialog(
+                heading="Create the VM?",
+                body=(
+                    "The first connection creates the VM — it downloads "
+                    "Ubuntu and installs the VPN client, which takes "
+                    "5–15 minutes and happens once."
+                ),
+            )
+            dialog.add_response("cancel", "_Cancel")
+            dialog.add_response("create", "_Create && Connect")
+            dialog.set_response_appearance(
+                "create", Adw.ResponseAppearance.SUGGESTED
+            )
+            dialog.set_close_response("cancel")
+            dialog.connect(
+                "response",
+                lambda _d, r: self._start_connect() if r == "create" else None,
+            )
+            dialog.present(self)
+            return
+        self._start_connect()
+
+    def _start_connect(self, password=None):
+        if self._busy():
             return
         self.action_running = True
         self.action = "connect"
+        self._progress_start("Connecting to VPN")
         self._apply_status()
         self.flow = vc.ConnectFlow(
             self._ask_password,
             self._ask_trust,
             self._connect_done,
+            password=password,
             on_warning=lambda msg: self.toast(
                 "Could not save password to keyring: %s" % msg
             ),
+            on_line=self._progress_line,
         )
         self.flow.start()
 
@@ -1662,6 +2468,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.flow = None
         self.action_running = False
         self.action = None
+        self._progress_stop()
         if rc == vc.EXIT_OK:
             self.last_failed = False
             self.toast("VPN connected")
@@ -1669,7 +2476,7 @@ class MainWindow(Adw.ApplicationWindow):
             self.toast("Another vmvpn operation is in progress")
         elif rc != vc.EXIT_PASSWORD_REQUIRED:
             self.last_failed = True
-            detail = _last_line(stderr) or _last_line(stdout)
+            detail = _readable_error(stdout, stderr)
             self.toast("Connect failed: %s" % (detail or "exit %s" % rc))
         self._apply_status()
         self._poll()
@@ -1765,7 +2572,7 @@ class MainWindow(Adw.ApplicationWindow):
 
 
 class VmVpnApp(Adw.Application):
-    _PAGES = ("status", "logs", "settings")
+    _PAGES = ("status", "logs", "settings", "setup")
 
     def __init__(self):
         super().__init__(
