@@ -13,5 +13,12 @@
     "port": 3128,
     "auto_start": false,
     "auto_stop": false
+  },
+  "vm": {
+    "cpus": 2,
+    "memory_mib": 512,
+    "disk_gib": 20,
+    "swap_mib": 0,
+    "swappiness": null
   }
 }

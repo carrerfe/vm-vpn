@@ -178,13 +178,15 @@ eval "$(./vmvpn completion zsh)"
 | Command          | Description                              |
 |------------------|------------------------------------------|
 | `start`          | Create and start the VM                  |
-| `stop`           | Stop the VM                              |
+| `stop [-f]`      | Stop the VM (`-f`: abort stuck ops, force stop) |
 | `restart`        | Restart the VM                           |
+| `abort`          | Kill a stuck vmvpn operation (+ guest VPN helpers) |
 | `shell`          | Open a shell in the VM                   |
 | `ssh`            | Connect via SSH                          |
 | `status`         | Show VM status (`--json` for machines)   |
-| `delete [-y]`    | Delete the VM and all its data           |
-| `logs SOURCE [-n N]` | Tail guest logs: `journal`, `squid`, `forticlient` |
+| `delete [-y|-f]` | Delete the VM and all its data (`-f`: force) |
+| `vm-apply [-y]`  | Apply the `vm` config section (may restart the VM) |
+| `logs SOURCE [-n N] [-f]` | Guest logs: `vpn`, `journal`, `squid`, `forticlient` (`-f`: follow) |
 
 ### VPN Commands
 | Command          | Description                              |
@@ -206,6 +208,7 @@ eval "$(./vmvpn completion zsh)"
 | Command            | Description                    |
 |--------------------|--------------------------------|
 | `version`          | Print version (`--version`/`-V`) |
+| `settings`         | Open the GUI settings window   |
 | `completion bash`  | Output bash completion script  |
 | `completion zsh`   | Output zsh completion script   |
 
@@ -222,6 +225,7 @@ eval "$(./vmvpn completion zsh)"
 │   ├── vmvpn_common.py     # Shared helpers (Gtk-free)
 │   ├── vmvpn-tray          # GTK3 + AppIndicator tray icon
 │   ├── vmvpn-window        # GTK4 + libadwaita window
+│   ├── icons/              # Own full-colour status icons (no theme needed)
 │   └── tests/              # Unit tests (no Gtk needed)
 └── README.md
 ```
@@ -257,6 +261,13 @@ Create `vpn-config.json` with your VPN and proxy settings:
     "port": 3128,
     "auto_start": false,
     "auto_stop": false
+  },
+  "vm": {
+    "cpus": 2,
+    "memory_mib": 512,
+    "disk_gib": 20,
+    "swap_mib": 0,
+    "swappiness": null
   }
 }
 ```
@@ -265,6 +276,14 @@ Create `vpn-config.json` with your VPN and proxy settings:
 - **socks_proxy**: SOCKS5 proxy via SSH (recommended for browsers)
 - **http_proxy**: Squid HTTP proxy
 - **auto_start/auto_stop**: Control proxy lifecycle with VPN connect/disconnect
+- **vm**: Optional VM resources. `cpus` (1..host CPUs), `memory_mib`
+  (256..host RAM), `disk_gib` (5..2048 — used at creation; can only grow via
+  `vmvpn vm-apply`), `swap_mib` (0 = no guest swap) and `swappiness`
+  (null = kernel default). **Every key is managed only when set**: an omitted
+  or null key leaves the VM/template value untouched — e.g. a VM created with
+  `VMVPN_SWAP_SIZE` keeps its swap as long as `swap_mib` is absent.
+  `VMVPN_SWAP_SIZE` / `VMVPN_SWAPPINESS` env vars count as set for the swap
+  values.
 
 > **Note:** `vpn-config.json` is gitignored to protect your credentials.
 > Prefer storing the password in the GNOME keyring (`vmvpn password-set`)
@@ -283,22 +302,30 @@ printf '%s\n' "$PW" | vmvpn password-set --stdin  # store in GNOME keyring
 vmvpn password-clear                   # remove stored password
 vmvpn cert-forget                      # forget saved certificate fingerprint
 vmvpn delete -y                        # no confirmation prompt
+vmvpn delete --force                   # abort stuck ops + force delete
+vmvpn stop --force                     # abort stuck ops + force stop
+vmvpn abort                            # kill a stuck vmvpn operation
 vmvpn logs journal -n 200              # tail the guest journal
 vmvpn logs squid                       # tail Squid cache/access logs
 vmvpn logs forticlient                 # tail FortiClient logs
+vmvpn logs vpn -f                      # stream the VPN connection log
 ```
 
 `status --json` always exits 0 and reports one object:
-`{schema, busy, vm{name,exists,status,dir,cpus,memory_bytes,disk_bytes}, guest{mem_total_bytes,mem_used_bytes,mem_available_bytes,swap_total_bytes,swap_used_bytes,squid_active}|null, vpn{state,raw}, proxies{socks{enabled,port,running},http{enabled,port,running}}, config{path,exists,valid,gateway,port,username,password_source}, cert{path,fingerprint}}`.
+`{schema, version, busy, vm{name,exists,status,dir,cpus,memory_bytes,disk_bytes}, vm_config{cpus,memory_mib,disk_gib,swap_mib,swappiness}, vm_pending_restart, guest{mem_total_bytes,mem_used_bytes,mem_available_bytes,swap_total_bytes,swap_used_bytes,squid_active}|null, vpn{state,raw}, proxies{socks{enabled,port,running},http{enabled,port,running}}, config{path,exists,valid,gateway,port,username,password_source}, cert{path,fingerprint}}`.
 `vpn.state` is `connected`/`disconnected`/`unknown`; `password_source` is `config`/`keyring`/`none` (the password itself is never printed).
 `busy` is `true` while another `vmvpn` process holds the operation lock.
+`vm_pending_restart` is `true` when the instance's cpus/memory/disk differ
+from the `vm` config (apply with `vmvpn vm-apply`).
 
-**Operation lock:** `start`, `stop`, `restart`, `delete`, `vpn-connect` and
-`vpn-disconnect` take a non-blocking `flock` on
+**Operation lock:** `start`, `stop`, `restart`, `delete`, `vm-apply`,
+`vpn-connect` and `vpn-disconnect` take a non-blocking `flock` on
 `${XDG_RUNTIME_DIR:-/tmp}/vmvpn-${VM_NAME}.lock`. If another vmvpn operation
 is in progress they print `Another vmvpn operation is in progress` to stderr
 and exit `6`. `status --json` exposes the same state as `busy` so callers can
-poll without taking the lock.
+poll without taking the lock. A stuck operation (e.g. a hung Lima or
+FortiClient call) can be killed with `vmvpn abort`, which terminates the
+lock holder's process tree and any stuck FortiClient helpers in the guest.
 
 Password resolution order for `vpn-connect`: `--password-stdin` → `password`
 in the config file → GNOME keyring (`service vmvpn`) → interactive prompt.
@@ -318,21 +345,30 @@ operation lock above).
 
 Two GUI front-ends drive the CLI without a terminal:
 
-- **`vmvpn-tray`** — a tray icon (StatusNotifierItem). Shows VPN/VM state at a
-  glance and offers Connect/Disconnect, proxy-address copy, "Launch VPN
-  Firefox", Start/Stop VM, "Open VM VPN…", a "Start at login" autostart
-  toggle, and Quit. It also shows desktop notifications (connect, disconnect,
-  login failed, certificate rejected, VPN connection lost).
+- **`vmvpn-tray`** — a tray icon (StatusNotifierItem) with its own
+  full-colour status icons (no icon theme needed). The menu shows the state
+  line (click → Status page), Connect/Disconnect (also the middle-click
+  target), "Launch VPN Firefox", "Settings…", "About VM VPN" and Quit. It
+  also shows desktop notifications (connect, disconnect, login failed,
+  certificate rejected, VPN connection lost, keyring-save failures).
 - **`vmvpn-window`** — a GTK4/libadwaita window (also in the app grid as
   "VM VPN") with three pages:
   - **Status**: VM name/state/CPUs/memory/disk, guest memory + swap bars,
     Squid state, VPN state with Connect/Disconnect, proxy cards with copy
-    buttons, Firefox launch, config/cert info.
-  - **Logs**: GUI activity, Lima host-agent and serial logs, and guest
-    `journal`/`squid`/`forticlient` logs, with tail-view, auto-refresh,
-    copy, and open-folder.
+    buttons, Firefox launch, config/cert info, and an Abort button while an
+    operation is running.
+  - **Logs**: "VPN (live)", FortiClient, Squid and guest journal streams
+    (`vmvpn logs -f`, restarted/stopped automatically with the VM), plus GUI
+    activity and Lima host logs — with a Follow toggle, copy, and
+    open-folder.
   - **Settings**: edit `vpn-config.json` (gateway/port/username, proxies,
-    certificate, startup), with Apply/Revert and a keyring password store.
+    certificate, startup, and the `vm` resources group with "Apply to VM"),
+    with Apply/Revert and a keyring password store. A Maintenance group
+    offers "Abort running operation", "Force stop VM" and "Delete VM".
+
+`vmvpn settings` opens the window on the Settings page; the window also
+accepts `--page status|logs|settings` (a second invocation reuses the
+running instance).
 
 Password dialogs offer "Remember in GNOME keyring"; when the server
 certificate is new or changed you get a trust dialog showing the fingerprint
@@ -451,17 +487,23 @@ memory: "512MiB" # RAM allocation
 disk: "20GiB"    # Disk size
 ```
 
-### Guest swap
+### Guest swap and VM resources
 
-Guest swap and `vm.swappiness` are off by default. Enable them when the VM
-is created:
+Guest swap and `vm.swappiness` are off by default. Configure them in the
+`vm` block of `vpn-config.json` (see above) or via env vars:
 
 ```bash
 VMVPN_SWAP_SIZE=4G VMVPN_SWAPPINESS=100 vmvpn start
 ```
 
-Both are baked into the instance at creation. To change them on an existing
-VM, recreate it: `vmvpn delete`, then start again with the variables set.
+Swap and swappiness are applied to the running guest on every `start` /
+`vpn-connect` — only when the keys are set, so changing `swap_mib`/
+`swappiness` in the config takes effect without recreating the VM (and an
+existing guest swap is never removed unless `swap_mib` is explicitly set).
+CPU/memory/disk changes require a restart — run `vmvpn vm-apply` (it refuses
+to shrink the disk, and only restarts when a managed key differs).
+`status --json` reports the managed values in `vm_config` (null = unmanaged)
+and flags pending resource changes with `vm_pending_restart`.
 
 ## License
 

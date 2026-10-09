@@ -309,21 +309,55 @@ def save_config(path, data):
     os.chmod(path, 0o600)
 
 
+# VM keys the CLI understands inside the optional "vm" config block.
+VM_CONFIG_KEYS = ("cpus", "memory_mib", "disk_gib", "swap_mib", "swappiness")
+
+
+def update_vm_config(cfg, values, touched):
+    """Merge GUI VM settings into cfg's "vm" block (managed-key semantics).
+
+    A setting the user never set is unmanaged: a vm key is written only when
+    it is already managed (present and non-None in the existing "vm" block)
+    or it is in `touched` (the user edited that row). `values` maps key ->
+    new value; None writes null (explicitly unmanaged, e.g. swappiness off).
+    Returns the set of keys written.
+    """
+    vm = cfg.get("vm")
+    if not isinstance(vm, dict):
+        vm = None
+    written = set()
+    for key in VM_CONFIG_KEYS:
+        if key not in values:
+            continue
+        managed = vm is not None and vm.get(key) is not None
+        if managed or key in touched:
+            if vm is None:
+                vm = {}
+                cfg["vm"] = vm
+            vm[key] = values[key]
+            written.add(key)
+    return written
+
+
 class ConnectFlow:
     """GTK-agnostic state machine driving `vmvpn vpn-connect`.
 
     ask_password(error_message_or_None, cb): cb(password_or_None, remember)
     ask_trust(new_fp, saved_fp_or_None, cb): cb(trusted_bool)
     on_done(rc, stdout, stderr): called once when the flow terminates.
+    on_warning(msg): optional, invoked when saving the password to the
+        keyring fails (msg from the CLI's stderr).
     """
 
     MAX_PASSWORD_PROMPTS = 3
     MAX_TRUST_PROMPTS = 1
 
-    def __init__(self, ask_password, ask_trust, on_done, password=None):
+    def __init__(self, ask_password, ask_trust, on_done, password=None,
+                 on_warning=None):
         self._ask_password = ask_password
         self._ask_trust = ask_trust
         self._on_done = on_done
+        self._on_warning = on_warning
         self._password = password
         self._remember = False
         self._trust_fp = None
@@ -365,7 +399,7 @@ class ConnectFlow:
 
         if rc in (EXIT_PASSWORD_REQUIRED, EXIT_LOGIN_FAILED):
             if self._pw_prompts >= self.MAX_PASSWORD_PROMPTS:
-                self._finish(rc, stdout, stderr)
+                self._finish_or_save(rc, stdout, stderr)
                 return
             self._pw_prompts += 1
             message = (
@@ -379,18 +413,14 @@ class ConnectFlow:
         if rc == EXIT_CERT_UNTRUSTED:
             parsed = parse_cert_untrusted(stdout)
             if parsed is None or self._trust_prompts >= self.MAX_TRUST_PROMPTS:
-                self._finish(rc, stdout, stderr)
+                self._finish_or_save(rc, stdout, stderr)
                 return
             self._trust_prompts += 1
             self._pending_new_fp, saved_fp = parsed
             self._ask_trust(self._pending_new_fp, saved_fp, self._on_trust)
             return
 
-        if rc == EXIT_OK and self._remember and self._password:
-            self._save_password()
-            return
-
-        self._finish(rc, stdout, stderr)
+        self._finish_or_save(rc, stdout, stderr)
 
     def _on_password(self, password, remember):
         if self._cancelled or self._finished:
@@ -411,13 +441,28 @@ class ConnectFlow:
         self._trust_fp = self._pending_new_fp
         self._run()
 
+    def _finish_or_save(self, rc, stdout, stderr):
+        """End the flow, saving the password first when asked to remember it.
+
+        The password is kept unless the connect ended with EXIT_LOGIN_FAILED
+        or the user cancelled a prompt (those paths call _finish directly).
+        """
+        self._last = (rc, stdout, stderr)
+        if self._remember and self._password and rc != EXIT_LOGIN_FAILED:
+            self._save_password()
+        else:
+            self._finish(rc, stdout, stderr)
+
     def _save_password(self):
         rc, stdout, stderr = self._last
         password = self._password
 
-        def _saved(_rc2, _out2, _err2):
+        def _saved(pw_rc, _out2, pw_stderr):
             if self._cancelled or self._finished:
                 return
+            if pw_rc != EXIT_OK and self._on_warning is not None:
+                msg = (pw_stderr or "").strip().splitlines()
+                self._on_warning(msg[-1] if msg else "keyring error")
             self._finish(rc, stdout, stderr)
 
         self._proc = run_cli(

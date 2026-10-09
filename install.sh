@@ -24,7 +24,7 @@ else
 fi
 
 # Create install directory if needed
-mkdir -p "$INSTALL_DIR" "$GUI_DIR"
+mkdir -p "$INSTALL_DIR" "$GUI_DIR/icons"
 
 # Fetch/copy files
 if [[ -n "$SOURCE_DIR" ]]; then
@@ -35,6 +35,7 @@ if [[ -n "$SOURCE_DIR" ]]; then
     cp "$SOURCE_DIR/gui/vmvpn_common.py" "$GUI_DIR/vmvpn_common.py"
     cp "$SOURCE_DIR/gui/vmvpn-tray" "$GUI_DIR/vmvpn-tray"
     cp "$SOURCE_DIR/gui/vmvpn-window" "$GUI_DIR/vmvpn-window"
+    cp "$SOURCE_DIR"/gui/icons/*.svg "$GUI_DIR/icons/"
 else
     echo "Downloading from $REPO_URL..."
     curl -fsSL "$RAW_URL/vmvpn" -o "$INSTALL_DIR/vmvpn"
@@ -43,6 +44,9 @@ else
     curl -fsSL "$RAW_URL/gui/vmvpn_common.py" -o "$GUI_DIR/vmvpn_common.py"
     curl -fsSL "$RAW_URL/gui/vmvpn-tray" -o "$GUI_DIR/vmvpn-tray"
     curl -fsSL "$RAW_URL/gui/vmvpn-window" -o "$GUI_DIR/vmvpn-window"
+    for icon in vmvpn-connected vmvpn-connecting vmvpn-disconnected vmvpn-off vmvpn-error; do
+        curl -fsSL "$RAW_URL/gui/icons/$icon.svg" -o "$GUI_DIR/icons/$icon.svg"
+    done
 fi
 
 # Make executable
