@@ -17,18 +17,23 @@ import vmvpn_common as vc
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 TRAY_PATH = os.path.join(SCRIPT_DIR, "vmvpn-tray")
+ICON_DIR = os.path.join(SCRIPT_DIR, "icons")
 POLL_SECONDS = 5
 GUEST_LOG_SECONDS = 10
 FILE_WATCH_SECONDS = 2
 FILE_TAIL_BYTES = 256 * 1024
 LOG_MAX_LINES = 2000
+STREAM_MAX_LINES = 5000
 
-ICON_CONNECTED = "network-vpn-symbolic"
-ICON_ACQUIRING = "network-vpn-acquiring-symbolic"
-ICON_DISCONNECTED = "network-vpn-disconnected-symbolic"
-ICON_DISABLED = "network-vpn-disabled-symbolic"
-ICON_NO_ROUTE = "network-vpn-no-route-symbolic"
-ICON_FALLBACK = "network-vpn"
+ICON_CONNECTED = "vmvpn-connected"
+ICON_ACQUIRING = "vmvpn-connecting"
+ICON_DISCONNECTED = "vmvpn-disconnected"
+ICON_DISABLED = "vmvpn-off"
+ICON_NO_ROUTE = "vmvpn-error"
+
+
+def _icon_file(name):
+    return os.path.join(ICON_DIR, name + ".svg")
 
 
 def _fmt_size(num):
@@ -58,7 +63,7 @@ class StatusPage(Gtk.Box):
         header.set_margin_bottom(6)
         header.set_margin_start(24)
         header.set_margin_end(24)
-        self.icon = Gtk.Image(icon_name=ICON_DISABLED)
+        self.icon = Gtk.Image.new_from_file(_icon_file(ICON_DISABLED))
         self.icon.set_pixel_size(48)
         header.append(self.icon)
         text_box = Gtk.Box(
@@ -71,6 +76,18 @@ class StatusPage(Gtk.Box):
         text_box.append(self.title_label)
         text_box.append(self.subtitle_label)
         header.append(text_box)
+        self.abort_btn = Gtk.Button(
+            label="Abort",
+            valign=Gtk.Align.CENTER,
+            tooltip_text="Kill the stuck vmvpn operation",
+        )
+        self.abort_btn.add_css_class("destructive-action")
+        self.abort_btn.set_visible(False)
+        self.abort_btn.connect(
+            "clicked",
+            lambda *_: self.win.run_action("Abort", ["abort"], force=True),
+        )
+        header.append(self.abort_btn)
         self.append(header)
 
         page = Adw.PreferencesPage()
@@ -256,7 +273,8 @@ class StatusPage(Gtk.Box):
             title, sub, icon = "Disconnected", "", ICON_DISCONNECTED
         if last_failed and not busy:
             icon = ICON_NO_ROUTE
-        self.icon.set_from_icon_name(icon)
+        self.abort_btn.set_visible(busy)
+        self.icon.set_from_file(_icon_file(icon))
         self.title_label.set_label(title)
         self.subtitle_label.set_label(sub)
         self.subtitle_label.set_visible(bool(sub))
@@ -417,15 +435,15 @@ class LogsPage(Gtk.Box):
 
         refresh = Gtk.Button(icon_name="view-refresh-symbolic",
                              tooltip_text="Refresh")
-        refresh.connect("clicked", lambda *_: self.reload())
+        refresh.connect("clicked", lambda *_: self._sync())
         top.append(refresh)
-        self.auto_btn = Gtk.ToggleButton(
+        self.follow_btn = Gtk.ToggleButton(
             icon_name="media-playlist-repeat-symbolic",
-            tooltip_text="Auto-refresh",
+            tooltip_text="Follow (live stream)",
         )
-        self.auto_btn.set_active(True)
-        self.auto_btn.connect("toggled", lambda *_: self._arm_auto())
-        top.append(self.auto_btn)
+        self.follow_btn.set_active(True)
+        self.follow_btn.connect("toggled", lambda *_: self._sync())
+        top.append(self.follow_btn)
         copy_btn = Gtk.Button(
             icon_name="edit-copy-symbolic", tooltip_text="Copy all"
         )
@@ -438,22 +456,28 @@ class LogsPage(Gtk.Box):
         top.append(folder_btn)
         self.append(top)
 
-        scrolled = Gtk.ScrolledWindow()
-        scrolled.set_vexpand(True)
-        scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.scrolled = Gtk.ScrolledWindow()
+        self.scrolled.set_vexpand(True)
+        self.scrolled.set_policy(
+            Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC
+        )
         self.text_view = Gtk.TextView()
         self.text_view.set_monospace(True)
         self.text_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self.text_view.set_editable(False)
         self.text_view.set_cursor_visible(False)
         self.buffer = self.text_view.get_buffer()
-        scrolled.set_child(self.text_view)
-        self.append(scrolled)
+        self.scrolled.set_child(self.text_view)
+        self.append(self.scrolled)
 
         self._sources_sig = None
         self._monitor = None
         self._timer = 0
         self._vm_dir = None
+        self._stream_proc = None    # Gio.Subprocess for guest follow mode
+        self._stream_src = None
+        self._file_offset = None    # appended-bytes tracking for file follow
+        self._file_partial = b""
 
     # -- source list -----------------------------------------------------------
 
@@ -476,6 +500,10 @@ class LogsPage(Gtk.Box):
         vm_running = vm.get("status") == "Running"
         vm_dir = vm.get("dir") or ""
         sources = [
+            LogSource("VPN (live)", "guest", "vpn", enabled=vm_running),
+            LogSource("FortiClient", "guest", "forticlient", enabled=vm_running),
+            LogSource("Squid", "guest", "squid", enabled=vm_running),
+            LogSource("Guest journal", "guest", "journal", enabled=vm_running),
             LogSource("GUI activity", "file", vc.gui_log_path()),
         ]
         if vm_dir:
@@ -488,12 +516,6 @@ class LogsPage(Gtk.Box):
                 path = os.path.join(vm_dir, fname)
                 if os.path.exists(path):
                     sources.append(LogSource(label, "file", path))
-        for label, ref in (
-            ("Guest journal", "journal"),
-            ("Squid", "squid"),
-            ("FortiClient", "forticlient"),
-        ):
-            sources.append(LogSource(label, "guest", ref, enabled=vm_running))
         return sources
 
     def update_status(self, status, _busy):
@@ -523,8 +545,12 @@ class LogsPage(Gtk.Box):
         return self.model.get_item(idx)
 
     def _on_selected(self, *_args):
-        self._arm_auto()
-        self.reload()
+        self._sync()
+
+    def shutdown(self):
+        """Stop timers and the log stream (window close)."""
+        self._disarm_auto()
+        self._stop_stream()
 
     # -- loading --------------------------------------------------------------
 
@@ -532,42 +558,185 @@ class LogsPage(Gtk.Box):
         self.buffer.set_text(text)
         GLib.idle_add(self._scroll_to_end)
 
+    def _append_line(self, line):
+        """Append one line; scroll only if the view is already at the bottom."""
+        adj = self.scrolled.get_vadjustment()
+        at_bottom = (
+            adj.get_upper() - adj.get_page_size() - adj.get_value() < 40
+        )
+        self.buffer.insert(self.buffer.get_end_iter(), line + "\n")
+        excess = self.buffer.get_line_count() - STREAM_MAX_LINES
+        if excess > 0:
+            self.buffer.delete(
+                self.buffer.get_start_iter(),
+                self.buffer.get_iter_at_line(excess),
+            )
+        if at_bottom:
+            GLib.idle_add(self._scroll_to_end)
+
     def _scroll_to_end(self):
         end = self.buffer.get_end_iter()
         self.text_view.scroll_to_iter(end, 0.0, True, 0.0, 1.0)
         return GLib.SOURCE_REMOVE
 
-    def reload(self):
+    def _sync(self):
+        """(Re)load the selected source and (re)arm its live mechanism."""
+        self._disarm_auto()
+        self._stop_stream()
+        self._file_offset = None
+        self._file_partial = b""
         src = self._current_source()
         if src is None:
             return
+        follow = self.follow_btn.get_active()
         if src.kind == "guest":
             if not src.enabled:
                 self._set_text("VM is not running.\n")
-                return
-            self._set_text("Loading %s…\n" % src.name)
-
-            def done(rc, stdout, stderr):
-                if self._current_source() is not src:
-                    return
-                if rc == vc.EXIT_OK:
-                    self._set_text(stdout or "(no output)\n")
-                else:
-                    detail = _last_line(stderr) or _last_line(stdout)
-                    vc.log_line(
-                        "logs %s failed (exit %s): %s"
-                        % (src.ref, rc, detail or "no output")
-                    )
-                    self._set_text(
-                        "logs %s failed (exit %s):\n%s"
-                        % (src.ref, rc, stderr or stdout)
-                    )
-
-            vc.run_cli(
-                ["logs", src.ref, "-n", str(LOG_MAX_LINES)], done, log=False
-            )
+            elif follow:
+                self._start_stream(src)
+            else:
+                self._reload_guest(src)
+                self._timer = GLib.timeout_add_seconds(
+                    GUEST_LOG_SECONDS, self._auto_tick
+                )
         else:
             self._load_file_tail(src.ref)
+            if follow:
+                self._timer = GLib.timeout_add_seconds(
+                    1, self._file_follow_tick
+                )
+            else:
+                self._arm_file_monitor(src)
+
+    def reload(self):
+        self._sync()
+
+    def _reload_current(self):
+        src = self._current_source()
+        if src is None:
+            return
+        if src.kind == "file":
+            self._load_file_tail(src.ref)
+        elif src.enabled:
+            self._reload_guest(src)
+
+    def _reload_guest(self, src):
+        self._set_text("Loading %s…\n" % src.name)
+
+        def done(rc, stdout, stderr):
+            if self._current_source() is not src:
+                return
+            if rc == vc.EXIT_OK:
+                self._set_text(stdout or "(no output)\n")
+            else:
+                detail = _last_line(stderr) or _last_line(stdout)
+                vc.log_line(
+                    "logs %s failed (exit %s): %s"
+                    % (src.ref, rc, detail or "no output")
+                )
+                self._set_text(
+                    "logs %s failed (exit %s):\n%s"
+                    % (src.ref, rc, stderr or stdout)
+                )
+
+        vc.run_cli(
+            ["logs", src.ref, "-n", str(LOG_MAX_LINES)], done, log=False
+        )
+
+    # -- live streaming ---------------------------------------------------------
+
+    def _start_stream(self, src):
+        """Follow a guest log via `vmvpn logs SRC -f` (unlogged stream).
+
+        stdin is kept open: closing it makes the remote follower exit, so no
+        orphaned tails remain in the guest when we stop or die.
+        """
+        self._set_text("")
+        cli = vc.find_cli()
+        if cli is None:
+            self._set_text("vmvpn CLI not found\n")
+            return
+        try:
+            proc = Gio.Subprocess.new(
+                [cli, "logs", src.ref, "-f", "-n", "200"],
+                Gio.SubprocessFlags.STDIN_PIPE
+                | Gio.SubprocessFlags.STDOUT_PIPE
+                | Gio.SubprocessFlags.STDERR_MERGE,
+            )
+        except GLib.Error as exc:
+            self._set_text("Could not start the log stream: %s\n" % exc.message)
+            return
+        self._stream_proc = proc
+        self._stream_src = src
+        reader = Gio.DataInputStream.new(proc.get_stdout_pipe())
+
+        def on_line(stream, res):
+            if self._stream_proc is not proc:
+                return
+            try:
+                line = stream.read_line_finish_utf8(res)[0]
+            except GLib.Error:
+                line = None
+            if line is None:
+                if self._stream_proc is proc:
+                    self._stream_proc = None
+                    self._stream_src = None
+                    self._append_line("— stream ended —")
+                return
+            self._append_line(line)
+            stream.read_line_async(GLib.PRIORITY_DEFAULT, None, on_line)
+
+        reader.read_line_async(GLib.PRIORITY_DEFAULT, None, on_line)
+
+    def _stop_stream(self):
+        proc = self._stream_proc
+        self._stream_proc = None
+        self._stream_src = None
+        if proc is None:
+            return
+        try:
+            proc.get_stdin_pipe().close(None)
+        except Exception:
+            pass
+        try:
+            proc.force_exit()
+        except Exception:
+            pass
+
+    def _file_follow_tick(self):
+        src = self._current_source()
+        if src is None or src.kind != "file":
+            return GLib.SOURCE_REMOVE
+        try:
+            size = os.path.getsize(src.ref)
+        except OSError:
+            return GLib.SOURCE_CONTINUE
+        if self._file_offset is None:
+            self._file_offset = size
+            return GLib.SOURCE_CONTINUE
+        if size < self._file_offset:
+            # truncated/rotated: reload the tail
+            self._file_offset = None
+            self._file_partial = b""
+            self._load_file_tail(src.ref)
+            return GLib.SOURCE_CONTINUE
+        if size == self._file_offset:
+            return GLib.SOURCE_CONTINUE
+        try:
+            with open(src.ref, "rb") as f:
+                f.seek(self._file_offset)
+                data = self._file_partial + f.read(1024 * 1024)
+                self._file_offset = f.tell()
+        except OSError:
+            return GLib.SOURCE_CONTINUE
+        lines = data.split(b"\n")
+        if data.endswith(b"\n"):
+            self._file_partial = b""
+        else:
+            self._file_partial = lines.pop()
+        for raw in lines:
+            self._append_line(raw.decode("utf-8", "replace"))
+        return GLib.SOURCE_CONTINUE
 
     def _load_file_tail(self, path):
         gfile = Gio.File.new_for_path(path)
@@ -624,11 +793,15 @@ class LogsPage(Gtk.Box):
             if start:
                 out = "… (last %d lines)\n%s" % (len(lines), out)
             self._set_text(out + "\n")
+            try:
+                self._file_offset = stream.tell()
+            except GLib.Error:
+                self._file_offset = size
             stream.close(None)
 
         read_more()
 
-    # -- auto refresh ----------------------------------------------------------
+    # -- non-follow auto refresh -------------------------------------------------
 
     def _disarm_auto(self):
         if self._monitor is not None:
@@ -638,33 +811,20 @@ class LogsPage(Gtk.Box):
             GLib.source_remove(self._timer)
             self._timer = 0
 
-    def _arm_auto(self):
-        self._disarm_auto()
-        if not self.auto_btn.get_active():
-            return
-        src = self._current_source()
-        if src is None:
-            return
-        if src.kind == "file":
-            try:
-                gfile = Gio.File.new_for_path(src.ref)
-                self._monitor = gfile.monitor_file(
-                    Gio.FileMonitorFlags.NONE, None
-                )
-                self._monitor.connect("changed", lambda *_: self.reload())
-            except GLib.Error:
-                self._timer = GLib.timeout_add_seconds(
-                    FILE_WATCH_SECONDS, self._auto_tick
-                )
-        else:
+    def _arm_file_monitor(self, src):
+        try:
+            gfile = Gio.File.new_for_path(src.ref)
+            self._monitor = gfile.monitor_file(
+                Gio.FileMonitorFlags.NONE, None
+            )
+            self._monitor.connect("changed", lambda *_: self._reload_current())
+        except GLib.Error:
             self._timer = GLib.timeout_add_seconds(
-                GUEST_LOG_SECONDS, self._auto_tick
+                FILE_WATCH_SECONDS, self._auto_tick
             )
 
     def _auto_tick(self):
-        src = self._current_source()
-        if src is not None and (src.kind == "file" or src.enabled):
-            self.reload()
+        self._reload_current()
         return GLib.SOURCE_CONTINUE
 
     # -- actions -----------------------------------------------------------------
@@ -699,6 +859,7 @@ class SettingsPage(Gtk.Box):
         self.cfg = None
         self._dirty = False
         self._filling = False
+        self._vm_touched = set()
 
         page = Adw.PreferencesPage()
         page.set_vexpand(True)
@@ -804,13 +965,97 @@ class SettingsPage(Gtk.Box):
 
         # Virtual machine ---------------------------------------------------------
         vm_group = Adw.PreferencesGroup(title="Virtual machine")
+        self.vm_cpus_row = Adw.SpinRow(
+            title="CPUs",
+            adjustment=Gtk.Adjustment(
+                value=2, lower=1, upper=max(1, os.cpu_count() or 1),
+                step_increment=1, page_increment=1,
+            ),
+            digits=0,
+        )
+        host_mem_mib = self._host_mem_mib()
+        self.vm_mem_row = Adw.SpinRow(
+            title="Memory (MiB)",
+            adjustment=Gtk.Adjustment(
+                value=512, lower=256, upper=host_mem_mib,
+                step_increment=256, page_increment=1024,
+            ),
+            digits=0,
+        )
+        self.vm_disk_row = Adw.SpinRow(
+            title="Disk (GiB)",
+            subtitle="Cannot be shrunk below the current disk size",
+            adjustment=Gtk.Adjustment(
+                value=20, lower=5, upper=2048,
+                step_increment=1, page_increment=5,
+            ),
+            digits=0,
+        )
+        self.vm_swap_row = Adw.SpinRow(
+            title="Swap (MiB)",
+            subtitle="0 disables guest swap",
+            adjustment=Gtk.Adjustment(
+                value=0, lower=0, upper=16384,
+                step_increment=256, page_increment=1024,
+            ),
+            digits=0,
+        )
+        self.vm_swappiness_sw = Adw.SwitchRow(title="Custom swappiness")
+        self.vm_swappiness_row = Adw.SpinRow(
+            title="Swappiness",
+            adjustment=Gtk.Adjustment(
+                value=60, lower=0, upper=200,
+                step_increment=5, page_increment=20,
+            ),
+            digits=0,
+        )
+        self.vm_swappiness_row.set_sensitive(False)
+        self.vm_swappiness_sw.connect(
+            "notify::active",
+            lambda row, *_: self.vm_swappiness_row.set_sensitive(
+                row.get_active()
+            ),
+        )
+        vm_group.add(self.vm_cpus_row)
+        vm_group.add(self.vm_mem_row)
+        vm_group.add(self.vm_disk_row)
+        vm_group.add(self.vm_swap_row)
+        vm_group.add(self.vm_swappiness_sw)
+        vm_group.add(self.vm_swappiness_row)
+
+        self.vm_apply_row = Adw.ActionRow(title="Apply to VM")
+        vm_apply_btn = Gtk.Button(label="Apply", valign=Gtk.Align.CENTER)
+        vm_apply_btn.connect("clicked", self._on_vm_apply)
+        self.vm_apply_row.add_suffix(vm_apply_btn)
+        vm_group.add(self.vm_apply_row)
+        page.add(vm_group)
+
+        # Maintenance ---------------------------------------------------------------
+        maint_group = Adw.PreferencesGroup(title="Maintenance")
+        self.abort_row = Adw.ActionRow(title="Abort running operation")
+        abort_btn = Gtk.Button(label="Abort", valign=Gtk.Align.CENTER)
+        abort_btn.add_css_class("destructive-action")
+        abort_btn.connect(
+            "clicked",
+            lambda *_: self.win.run_action("Abort", ["abort"], force=True),
+        )
+        self.abort_row.add_suffix(abort_btn)
+        maint_group.add(self.abort_row)
+
+        self.force_stop_row = Adw.ActionRow(title="Force stop VM")
+        force_stop_btn = Gtk.Button(label="Force stop", valign=Gtk.Align.CENTER)
+        force_stop_btn.add_css_class("destructive-action")
+        force_stop_btn.connect("clicked", self._on_force_stop)
+        self.force_stop_row.add_suffix(force_stop_btn)
+        maint_group.add(self.force_stop_row)
+
         self.delete_row = Adw.ActionRow(title="Delete VM")
         delete_btn = Gtk.Button(label="Delete", valign=Gtk.Align.CENTER)
         delete_btn.add_css_class("destructive-action")
         delete_btn.connect("clicked", self._on_delete_vm)
         self.delete_row.add_suffix(delete_btn)
-        vm_group.add(self.delete_row)
-        page.add(vm_group)
+        maint_group.add(self.delete_row)
+        page.add(maint_group)
 
         self.append(page)
 
@@ -847,8 +1092,36 @@ class SettingsPage(Gtk.Box):
             self.http_auto_stop,
         ):
             row.connect("notify::active", self._mark_dirty)
+        # VM rows: a key becomes managed only when the user edits the row
+        # (or the row's key was already set in the config file).
+        for row, key in (
+            (self.vm_cpus_row, "cpus"),
+            (self.vm_mem_row, "memory_mib"),
+            (self.vm_disk_row, "disk_gib"),
+            (self.vm_swap_row, "swap_mib"),
+            (self.vm_swappiness_row, "swappiness"),
+        ):
+            row.connect(
+                "notify::value",
+                lambda r, _pspec, k=key: self._mark_dirty_vm(k),
+            )
+        self.vm_swappiness_sw.connect(
+            "notify::active",
+            lambda *_: self._mark_dirty_vm("swappiness"),
+        )
 
         self._update_buttons()
+
+    @staticmethod
+    def _host_mem_mib():
+        try:
+            with open("/proc/meminfo", encoding="ascii") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        return max(1024, int(line.split()[1]) // 1024)
+        except (OSError, ValueError):
+            pass
+        return 65536
 
     # -- load/save ---------------------------------------------------------------
 
@@ -883,6 +1156,24 @@ class SettingsPage(Gtk.Box):
         fp = ((status or {}).get("cert") or {}).get("fingerprint")
         self.cert_row.set_subtitle(str(fp) if fp else "None saved")
 
+        vm = (status or {}).get("vm") or {}
+        busy = bool(_busy)
+        self.abort_row.set_sensitive(busy)
+        pending = bool((status or {}).get("vm_pending_restart"))
+        self.vm_apply_row.set_subtitle(
+            "Restart required to apply" if pending else ""
+        )
+        # Disk cannot shrink: the lower bound follows the live instance size.
+        disk_bytes = vm.get("disk_bytes")
+        if isinstance(disk_bytes, (int, float)) and disk_bytes > 0:
+            disk_gib = max(5, int(round(disk_bytes / 1073741824)))
+            self._filling = True
+            self.vm_disk_row.get_adjustment().set_lower(disk_gib)
+            self._filling = False
+        # Unmanaged rows mirror the live instance until the user edits them.
+        if not self._dirty:
+            self._fill_vm_rows()
+
     def load(self, path):
         self.path = path
         self.cfg = vc.load_config(path)
@@ -904,9 +1195,59 @@ class SettingsPage(Gtk.Box):
         self.http_port.set_value(float(http.get("port") or 3128))
         self.http_auto_start.set_active(bool(http.get("auto_start", False)))
         self.http_auto_stop.set_active(bool(http.get("auto_stop", False)))
+        self._vm_touched = set()
+        self._fill_vm_rows()
         self._filling = False
         self._dirty = False
         self._update_buttons()
+
+    def _fill_vm_rows(self):
+        """Fill the VM rows: config value when managed, else the live
+        instance value from the last status, else the template default."""
+        vm_cfg = (self.cfg or {}).get("vm") or {}
+        vm_live = ((self.win.status or {}).get("vm") or {})
+        guest = ((self.win.status or {}).get("guest") or {})
+
+        def live_mib(key, bytes_key):
+            val = vm_live.get(bytes_key) or guest.get(bytes_key)
+            if isinstance(val, (int, float)) and val > 0:
+                return int(round(val / 1048576))
+            return None
+
+        live = {
+            "cpus": vm_live.get("cpus"),
+            "memory_mib": live_mib("memory_mib", "memory_bytes"),
+            "disk_gib": (
+                int(round(vm_live["disk_bytes"] / 1073741824))
+                if isinstance(vm_live.get("disk_bytes"), (int, float))
+                and vm_live["disk_bytes"] > 0
+                else None
+            ),
+            "swap_mib": live_mib("swap_mib", "swap_total_bytes"),
+        }
+        defaults = {"cpus": 2, "memory_mib": 512, "disk_gib": 20,
+                    "swap_mib": 0}
+
+        def pick(key):
+            if vm_cfg.get(key) is not None:
+                return vm_cfg[key]
+            if live.get(key) is not None:
+                return live[key]
+            return defaults[key]
+
+        was_filling = self._filling
+        self._filling = True
+        self.vm_cpus_row.set_value(float(pick("cpus")))
+        self.vm_mem_row.set_value(float(pick("memory_mib")))
+        self.vm_disk_row.set_value(float(pick("disk_gib")))
+        self.vm_swap_row.set_value(float(pick("swap_mib")))
+        swappiness = vm_cfg.get("swappiness")
+        self.vm_swappiness_sw.set_active(swappiness is not None)
+        self.vm_swappiness_row.set_value(
+            float(swappiness if swappiness is not None else 60)
+        )
+        self.vm_swappiness_row.set_sensitive(swappiness is not None)
+        self._filling = was_filling
 
     def _collect(self):
         cfg = self.cfg
@@ -923,6 +1264,25 @@ class SettingsPage(Gtk.Box):
         http["port"] = int(self.http_port.get_value())
         http["auto_start"] = self.http_auto_start.get_active()
         http["auto_stop"] = self.http_auto_stop.get_active()
+        vc.update_vm_config(
+            cfg,
+            {
+                "cpus": int(self.vm_cpus_row.get_value()),
+                "memory_mib": int(self.vm_mem_row.get_value()),
+                "disk_gib": int(self.vm_disk_row.get_value()),
+                "swap_mib": int(self.vm_swap_row.get_value()),
+                "swappiness": (
+                    int(self.vm_swappiness_row.get_value())
+                    if self.vm_swappiness_sw.get_active()
+                    else None
+                ),
+            },
+            getattr(self, "_vm_touched", set()),
+        )
+
+    def _mark_dirty_vm(self, key):
+        self._vm_touched.add(key)
+        self._mark_dirty()
 
     def _mark_dirty(self, *_args):
         if self._filling:
@@ -1074,7 +1434,62 @@ class SettingsPage(Gtk.Box):
 
         def on_response(_dlg, response):
             if response == "delete":
-                self.win.run_action("Delete VM", ["delete", "-y"])
+                self.win.run_action(
+                    "Delete VM", ["delete", "--force"], force=True
+                )
+
+        dialog.connect("response", on_response)
+        dialog.present(self.get_root())
+
+    # -- VM apply / force stop ------------------------------------------------------
+
+    def _on_vm_apply(self, *_args):
+        pending = bool(
+            (self.win.status or {}).get("vm_pending_restart")
+        )
+        if not pending:
+            self.win.run_action(
+                "Apply VM settings", ["vm-apply", "-y"], force=True
+            )
+            return
+        dialog = Adw.AlertDialog(
+            heading="Apply VM settings?",
+            body="The VM will restart and the VPN will disconnect.",
+        )
+        dialog.add_response("cancel", "_Cancel")
+        dialog.add_response("apply", "_Apply")
+        dialog.set_response_appearance(
+            "apply", Adw.ResponseAppearance.SUGGESTED
+        )
+        dialog.set_close_response("cancel")
+
+        def on_response(_dlg, response):
+            if response == "apply":
+                self.win.run_action(
+                    "Apply VM settings", ["vm-apply", "-y"], force=True
+                )
+
+        dialog.connect("response", on_response)
+        dialog.present(self.get_root())
+
+    def _on_force_stop(self, *_args):
+        dialog = Adw.AlertDialog(
+            heading="Force stop the VM?",
+            body="Aborts any running vmvpn operation and stops the VM "
+            "immediately. Unsaved guest data may be lost.",
+        )
+        dialog.add_response("cancel", "_Cancel")
+        dialog.add_response("force", "_Force stop")
+        dialog.set_response_appearance(
+            "force", Adw.ResponseAppearance.DESTRUCTIVE
+        )
+        dialog.set_close_response("cancel")
+
+        def on_response(_dlg, response):
+            if response == "force":
+                self.win.run_action(
+                    "Force stop VM", ["stop", "--force"], force=True
+                )
 
         dialog.connect("response", on_response)
         dialog.present(self.get_root())
@@ -1137,8 +1552,17 @@ class MainWindow(Adw.ApplicationWindow):
         self.add_action(refresh_action)
 
         self.connect("map", lambda *_: self._poll())
+        self.connect("close-request", self._on_close)
         GLib.timeout_add_seconds(POLL_SECONDS, self._poll_tick)
         self._apply_status()
+
+    def show_page(self, name):
+        if name in ("status", "logs", "settings"):
+            self.stack.set_visible_child_name(name)
+
+    def _on_close(self, *_args):
+        self.logs_page.shutdown()
+        return False
 
     # -- helpers ------------------------------------------------------------------
 
@@ -1189,8 +1613,8 @@ class MainWindow(Adw.ApplicationWindow):
 
     # -- actions -----------------------------------------------------------------------
 
-    def run_action(self, label, args):
-        if self._busy():
+    def run_action(self, label, args, force=False):
+        if self._busy() and not force:
             return
         self.action_running = True
         self.action = label
@@ -1225,7 +1649,12 @@ class MainWindow(Adw.ApplicationWindow):
         self.action = "connect"
         self._apply_status()
         self.flow = vc.ConnectFlow(
-            self._ask_password, self._ask_trust, self._connect_done
+            self._ask_password,
+            self._ask_trust,
+            self._connect_done,
+            on_warning=lambda msg: self.toast(
+                "Could not save password to keyring: %s" % msg
+            ),
         )
         self.flow.start()
 
@@ -1336,8 +1765,22 @@ class MainWindow(Adw.ApplicationWindow):
 
 
 class VmVpnApp(Adw.Application):
+    _PAGES = ("status", "logs", "settings")
+
     def __init__(self):
-        super().__init__(application_id="io.github.carrerfe.VmVpn")
+        super().__init__(
+            application_id="io.github.carrerfe.VmVpn",
+            flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE,
+        )
+        self.add_main_option(
+            "page",
+            0,
+            GLib.OptionFlags.NONE,
+            GLib.OptionArg.STRING,
+            "Page to show: status, logs or settings",
+            "PAGE",
+        )
+        self._pending_page = None
         self.connect("activate", self._on_activate)
 
         about = Gio.SimpleAction.new("about", None)
@@ -1347,11 +1790,36 @@ class VmVpnApp(Adw.Application):
         quit_action.connect("activate", lambda *_: self.quit())
         self.add_action(quit_action)
 
+    def do_command_line(self, command_line):
+        options = command_line.get_options_dict()
+        page = None
+        if options.contains("page"):
+            page = options.lookup_value(
+                "page", GLib.VariantType("s")
+            ).get_string()
+        if page is not None and page not in self._PAGES:
+            command_line.printerr_literal(
+                "vmvpn-window: unknown page '%s'\n" % page
+            )
+            return 1
+        self.activate()
+        win = self.props.active_window
+        if page is None:
+            return 0
+        if win is not None:
+            win.show_page(page)
+        else:
+            self._pending_page = page
+        return 0
+
     def _on_activate(self, app):
         win = self.props.active_window
         if win is None:
             win = MainWindow(application=self)
         win.present()
+        if self._pending_page is not None:
+            win.show_page(self._pending_page)
+            self._pending_page = None
 
     def _on_about(self, *_args):
         win = self.props.active_window
@@ -1381,7 +1849,7 @@ def main():
         print("vmvpn-window %s" % vc.VERSION)
         return 0
     app = VmVpnApp()
-    return app.run([sys.argv[0]])
+    return app.run(sys.argv)
 
 
 if __name__ == "__main__":

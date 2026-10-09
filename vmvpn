@@ -10,7 +10,7 @@ FIREFOX_PROFILE_NAME="vmvpn"
 START_TIMEOUT="30m"
 VMVPN_VERSION="1.0.0"
 
-COMMANDS="start stop restart shell ssh status delete logs vpn-connect vpn-disconnect vpn-status password-set password-clear cert-forget firefox firefox-profile completion version"
+COMMANDS="start stop restart abort settings shell ssh status delete vm-apply logs vpn-connect vpn-disconnect vpn-status password-set password-clear cert-forget firefox firefox-profile completion version"
 
 usage() {
     echo "vmvpn - VM VPN CLI"
@@ -19,14 +19,17 @@ usage() {
     echo ""
     echo "VM Commands:"
     echo "  start           Create and start the VM"
-    echo "  stop            Stop the VM"
+    echo "  stop [-f]       Stop the VM (-f: abort running op, force stop)"
     echo "  restart         Restart the VM"
+    echo "  abort           Kill a stuck vmvpn operation (and guest VPN helpers)"
     echo "  shell           Open a shell in the VM"
     echo "  ssh             Connect via SSH"
     echo "  status [--json] Show VM status (--json: machine-readable output)"
-    echo "  delete [-y]     Delete the VM completely (-y: skip confirmation)"
-    echo "  logs <source> [-n N]"
-    echo "                  Guest logs: journal, squid, forticlient (default: 200 lines)"
+    echo "  delete [-y|-f]  Delete the VM completely (-y: skip confirmation, -f: force)"
+    echo "  vm-apply [-y]   Apply the 'vm' config section to the VM (may restart it)"
+    echo "  logs <source> [-n N] [-f]"
+    echo "                  Guest logs: vpn, journal, squid, forticlient"
+    echo "                  (default: 200 lines; -f: follow/stream)"
     echo ""
     echo "VPN Commands:"
     echo "  vpn-connect [--password-stdin] [--trust-fingerprint FP]"
@@ -36,6 +39,7 @@ usage() {
     echo "  password-set [--stdin]   Store VPN password in GNOME keyring"
     echo "  password-clear           Remove VPN password from GNOME keyring"
     echo "  cert-forget              Forget saved VPN certificate fingerprint"
+    echo "  settings                 Open the GUI settings window"
     echo ""
     echo "Browser Commands:"
     echo "  firefox         Launch Firefox with VPN proxy profile"
@@ -51,8 +55,8 @@ usage() {
     echo "Environment variables:"
     echo "  VPN_CONFIG        Path to VPN config JSON file (default: ./vpn-config.json)"
     echo "  VMVPN_VM_NAME     Lima VM name to manage (default: vmvpn)"
-    echo "  VMVPN_SWAP_SIZE   Guest swap file size, applied at VM creation (e.g. 4G; default: no swap)"
-    echo "  VMVPN_SWAPPINESS  Guest vm.swappiness, applied at VM creation (e.g. 100; default: kernel default)"
+    echo "  VMVPN_SWAP_SIZE   Guest swap file size, overrides config vm.swap_mib (e.g. 4G)"
+    echo "  VMVPN_SWAPPINESS  Guest vm.swappiness, overrides config vm.swappiness (e.g. 100)"
     echo ""
     echo "Exit codes:"
     echo "  0  success"
@@ -70,18 +74,22 @@ usage() {
 # for the lifetime of the process.
 take_operation_lock() {
     local lock_file="${XDG_RUNTIME_DIR:-/tmp}/vmvpn-${VM_NAME}.lock"
+    mkdir -p "${XDG_RUNTIME_DIR:-/tmp}"
     exec 9>"$lock_file"
     if ! flock -n 9; then
         echo "Another vmvpn operation is in progress" >&2
         exit 6
     fi
+    # Record who holds the lock for 'vmvpn abort' (separate file: probing the
+    # lock with `>` would truncate the lock file itself).
+    printf '%s %s\n' "$$" "$*" > "${lock_file}.pid"
 }
 
 # Take the lock, then run a command in a subshell with fd 9 closed so that
 # spawned processes (limactl -> hostagent -> qemu) do not inherit the lock fd
 # and keep it held after this script exits.
 run_locked() {
-    take_operation_lock
+    take_operation_lock "$1"
     ( exec 9>&-; "$@" )
 }
 
@@ -89,6 +97,79 @@ run_locked() {
 operation_lock_free() {
     local lock_file="${XDG_RUNTIME_DIR:-/tmp}/vmvpn-${VM_NAME}.lock"
     ( exec 9>"$lock_file"; flock -n 9 ) 2>/dev/null
+}
+
+# Recursively print all descendant pids of $1.
+collect_descendants() {
+    local child
+    for child in $(ps -o pid= --ppid "$1" 2>/dev/null); do
+        echo "$child"
+        collect_descendants "$child"
+    done
+}
+
+# Kill a stuck vmvpn operation: TERM the lock holder and its whole process
+# tree, wait briefly, KILL survivors. Also kills stuck FortiClient helpers in
+# the guest, which can hold FortiClient's single-instance lock.
+abort() {
+    local lock_file="${XDG_RUNTIME_DIR:-/tmp}/vmvpn-${VM_NAME}.lock"
+    local pid_file="${lock_file}.pid"
+    local killed=false
+
+    if ! operation_lock_free && [[ -f "$pid_file" ]]; then
+        local holder_pid _holder_cmd
+        read -r holder_pid _holder_cmd < "$pid_file" || true
+        if [[ "$holder_pid" =~ ^[0-9]+$ ]] && kill -0 "$holder_pid" 2>/dev/null \
+           && tr '\0' ' ' < "/proc/$holder_pid/cmdline" 2>/dev/null | grep -q "vmvpn"; then
+            local victims v
+            victims=$(collect_descendants "$holder_pid")
+            for v in $holder_pid $victims; do
+                local vcmd
+                vcmd=$(tr '\0' ' ' < "/proc/$v/cmdline" 2>/dev/null || true)
+                echo "Terminating $v ${vcmd:-(process)}"
+                kill -TERM "$v" 2>/dev/null || true
+            done
+            local waited=0
+            while (( waited < 30 )); do
+                local alive=false v2
+                for v2 in $holder_pid $victims; do
+                    if kill -0 "$v2" 2>/dev/null; then alive=true; break; fi
+                done
+                [[ "$alive" == "false" ]] && break
+                sleep 0.1
+                waited=$((waited + 1))
+            done
+            for v in $holder_pid $victims; do
+                if kill -0 "$v" 2>/dev/null; then
+                    echo "Force killing $v"
+                    kill -KILL "$v" 2>/dev/null || true
+                fi
+            done
+            killed=true
+        fi
+        # Wait until the lock is actually released
+        waited=0
+        while ! operation_lock_free && (( waited < 20 )); do
+            sleep 0.1
+            waited=$((waited + 1))
+        done
+    fi
+    rm -f "$pid_file"
+
+    # Kill stuck FortiClient helpers in the guest (VM running only).
+    if command -v limactl >/dev/null 2>&1 && \
+       limactl list 2>/dev/null | awk -v n="$VM_NAME" '$1 == n && $2 == "Running" { f=1 } END { exit !f }'; then
+        limactl shell "$VM_NAME" -- sudo sh -c \
+            'for p in fortivpn forticlient-cli expect; do
+                 pkill -x "$p" 2>/dev/null && echo "Killed guest process: $p"
+             done; exit 0' 2>/dev/null || true
+    fi
+
+    if [[ "$killed" == "true" ]]; then
+        echo "Operation aborted."
+    else
+        echo "Nothing to abort."
+    fi
 }
 
 check_lima() {
@@ -115,21 +196,141 @@ check_jq() {
     fi
 }
 
+# Effective VM resources. The optional "vm" object in vpn-config.json manages
+# each resource independently: a key that is absent or null is UNMANAGED (the
+# instance/template keeps whatever it has; empty VM_CFG_*). VMVPN_SWAP_SIZE /
+# VMVPN_SWAPPINESS count as set for the swap values. read_vm_config only fills
+# the globals (safe in status_json); validate_vm_config exits on bad values.
+VM_CFG_CPUS=""
+VM_CFG_MEMORY_MIB=""
+VM_CFG_DISK_GIB=""
+VM_CFG_SWAP_MIB=""
+VM_CFG_SWAPPINESS=""
+
+read_vm_config() {
+    VM_CFG_CPUS=""; VM_CFG_MEMORY_MIB=""; VM_CFG_DISK_GIB=""
+    VM_CFG_SWAP_MIB=""; VM_CFG_SWAPPINESS=""
+    if [[ -f "$VPN_CONFIG" ]] && command -v jq >/dev/null 2>&1 \
+       && jq empty "$VPN_CONFIG" 2>/dev/null; then
+        # One value per line (empty = unset): mapfile keeps empty fields,
+        # which a tab-separated `read` would collapse.
+        local -a vals=()
+        mapfile -t vals < <(jq -r '(.vm | if type == "object" then . else {} end) |
+            [.cpus, .memory_mib, .disk_gib, .swap_mib, .swappiness] |
+            map(if . == null then "" else tostring end) | .[]' "$VPN_CONFIG" 2>/dev/null)
+        if [[ ${#vals[@]} -eq 5 ]]; then
+            VM_CFG_CPUS="${vals[0]}"; VM_CFG_MEMORY_MIB="${vals[1]}"
+            VM_CFG_DISK_GIB="${vals[2]}"; VM_CFG_SWAP_MIB="${vals[3]}"
+            VM_CFG_SWAPPINESS="${vals[4]}"
+        fi
+    fi
+    if [[ -n "${VMVPN_SWAP_SIZE:-}" ]]; then
+        if [[ "$VMVPN_SWAP_SIZE" =~ ^[1-9][0-9]*[KMG]?$ ]]; then
+            case "$VMVPN_SWAP_SIZE" in
+                *G) VM_CFG_SWAP_MIB=$(( ${VMVPN_SWAP_SIZE%G} * 1024 )) ;;
+                *M) VM_CFG_SWAP_MIB=$(( 10#${VMVPN_SWAP_SIZE%M} )) ;;
+                *K) VM_CFG_SWAP_MIB=$(( 10#${VMVPN_SWAP_SIZE%K} / 1024 )) ;;
+                *)  VM_CFG_SWAP_MIB=$(( 10#$VMVPN_SWAP_SIZE / 1048576 )) ;;
+            esac
+        else
+            echo "Warning: invalid VMVPN_SWAP_SIZE '$VMVPN_SWAP_SIZE'; ignoring." >&2
+        fi
+    fi
+    if [[ -n "${VMVPN_SWAPPINESS:-}" ]]; then
+        VM_CFG_SWAPPINESS="$VMVPN_SWAPPINESS"
+    fi
+}
+
+validate_vm_config() {
+    read_vm_config
+    local ncpu mem_total_mib
+    ncpu=$(nproc 2>/dev/null || echo 1)
+    mem_total_mib=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+    [[ -n "$mem_total_mib" && "$mem_total_mib" =~ ^[0-9]+$ ]] || mem_total_mib=0
+    if [[ -n "$VM_CFG_CPUS" ]] && \
+       { [[ ! "$VM_CFG_CPUS" =~ ^[0-9]+$ ]] || (( 10#$VM_CFG_CPUS < 1 || 10#$VM_CFG_CPUS > ncpu )); }; then
+        echo "Error: vm.cpus must be an integer between 1 and $ncpu" >&2; exit 5
+    fi
+    if [[ -n "$VM_CFG_MEMORY_MIB" ]] && \
+       { [[ ! "$VM_CFG_MEMORY_MIB" =~ ^[0-9]+$ ]] || \
+         (( 10#$VM_CFG_MEMORY_MIB < 256 || ( mem_total_mib > 0 && 10#$VM_CFG_MEMORY_MIB > mem_total_mib ) )); }; then
+        echo "Error: vm.memory_mib must be an integer between 256 and ${mem_total_mib:-<host RAM MiB>}" >&2; exit 5
+    fi
+    if [[ -n "$VM_CFG_DISK_GIB" ]] && \
+       { [[ ! "$VM_CFG_DISK_GIB" =~ ^[0-9]+$ ]] || (( 10#$VM_CFG_DISK_GIB < 5 || 10#$VM_CFG_DISK_GIB > 2048 )); }; then
+        echo "Error: vm.disk_gib must be an integer between 5 and 2048" >&2; exit 5
+    fi
+    if [[ -n "$VM_CFG_SWAP_MIB" ]] && \
+       { [[ ! "$VM_CFG_SWAP_MIB" =~ ^[0-9]+$ ]] || (( 10#$VM_CFG_SWAP_MIB > 65536 )); }; then
+        echo "Error: vm.swap_mib must be an integer between 0 and 65536" >&2; exit 5
+    fi
+    if [[ -n "$VM_CFG_SWAPPINESS" ]] && \
+       { [[ ! "$VM_CFG_SWAPPINESS" =~ ^[0-9]+$ ]] || (( 10#$VM_CFG_SWAPPINESS > 200 )); }; then
+        echo "Error: vm.swappiness must be null or an integer between 0 and 200" >&2; exit 5
+    fi
+    [[ -n "$VM_CFG_CPUS" ]] && VM_CFG_CPUS=$((10#$VM_CFG_CPUS))
+    [[ -n "$VM_CFG_MEMORY_MIB" ]] && VM_CFG_MEMORY_MIB=$((10#$VM_CFG_MEMORY_MIB))
+    [[ -n "$VM_CFG_DISK_GIB" ]] && VM_CFG_DISK_GIB=$((10#$VM_CFG_DISK_GIB))
+    [[ -n "$VM_CFG_SWAP_MIB" ]] && VM_CFG_SWAP_MIB=$((10#$VM_CFG_SWAP_MIB))
+    return 0
+}
+
+# Idempotently apply the configured guest swap and swappiness. One guest call.
+apply_guest_swap() {
+    limactl list 2>/dev/null | awk -v n="$VM_NAME" '$1 == n && $2 == "Running" { f=1 } END { exit !f }' \
+        || return 0
+    read_vm_config
+    limactl shell "$VM_NAME" -- sudo sh -c '
+        SWAP_MIB="$1"; SWAPPINESS="$2"
+        if [ -n "$SWAP_MIB" ] && [ "$SWAP_MIB" = "0" ]; then
+            if grep -q "^/swapfile " /proc/swaps 2>/dev/null; then
+                if ! swapoff /swapfile; then
+                    echo "Error: swapoff failed (memory pressure); leaving existing swap." >&2
+                    exit 1
+                fi
+            fi
+            rm -f /swapfile
+            sed -i "\|^/swapfile |d" /etc/fstab 2>/dev/null || true
+        elif [ -n "$SWAP_MIB" ]; then
+            cur=$(awk "\$1 == \"/swapfile\" { print \$3 }" /proc/swaps 2>/dev/null)
+            want_kib=$((SWAP_MIB * 1024))
+            if [ ! -f /swapfile ] || [ "$cur" != "$want_kib" ]; then
+                if grep -q "^/swapfile " /proc/swaps 2>/dev/null \
+                   && ! swapoff /swapfile; then
+                    echo "Error: swapoff failed (memory pressure); cannot resize swap." >&2
+                    exit 1
+                fi
+                rm -f /swapfile
+                fallocate -l "${SWAP_MIB}M" /swapfile || exit 1
+                chmod 600 /swapfile
+                mkswap /swapfile >/dev/null || exit 1
+                swapon /swapfile || exit 1
+            fi
+            grep -q "^/swapfile " /etc/fstab 2>/dev/null \
+                || echo "/swapfile none swap sw 0 0" >> /etc/fstab
+        fi
+        if [ -n "$SWAPPINESS" ]; then
+            sysctl -w "vm.swappiness=$SWAPPINESS" >/dev/null || exit 1
+            echo "vm.swappiness=$SWAPPINESS" > /etc/sysctl.d/99-vmvpn-swap.conf
+        fi
+    ' _ "$VM_CFG_SWAP_MIB" "$VM_CFG_SWAPPINESS"
+}
+
 create_vm() {
+    validate_vm_config
     local args=(--name="$VM_NAME" --timeout="$START_TIMEOUT")
+    [[ -n "$VM_CFG_CPUS" ]] && args+=(--cpus "$VM_CFG_CPUS")
+    if [[ -n "$VM_CFG_MEMORY_MIB" ]]; then
+        local mem_gib
+        mem_gib=$(awk -v m="$VM_CFG_MEMORY_MIB" 'BEGIN{printf "%g", m/1024}')
+        args+=(--memory "$mem_gib")
+    fi
+    [[ -n "$VM_CFG_DISK_GIB" ]] && args+=(--disk "$VM_CFG_DISK_GIB")
     [[ -t 0 ]] || args+=(--tty=false)
     if [[ -n "${VMVPN_SWAP_SIZE:-}" ]]; then
-        if [[ ! "$VMVPN_SWAP_SIZE" =~ ^[1-9][0-9]*[KMG]?$ ]]; then
-            echo "Error: VMVPN_SWAP_SIZE must look like 4G, 512M or 1048576K"
-            exit 1
-        fi
         args+=(--set ".param.SWAP_SIZE = \"$VMVPN_SWAP_SIZE\"")
     fi
     if [[ -n "${VMVPN_SWAPPINESS:-}" ]]; then
-        if [[ ! "$VMVPN_SWAPPINESS" =~ ^[0-9]+$ ]] || (( 10#$VMVPN_SWAPPINESS > 200 )); then
-            echo "Error: VMVPN_SWAPPINESS must be an integer between 0 and 200"
-            exit 1
-        fi
         args+=(--set ".param.SWAPPINESS = \"$VMVPN_SWAPPINESS\"")
     fi
     limactl start "${args[@]}" "$VM_CONFIG"
@@ -144,19 +345,137 @@ start() {
         echo "Creating and starting VM..."
         create_vm
     fi
+    apply_guest_swap || echo "Warning: could not apply guest swap settings." >&2
     echo ""
     echo "VM is ready. Use '$0 shell' to access it."
 }
 
-stop() {
+vm_stop() {
     check_lima
+    local force="${1:-}"
     echo "Stopping VM..."
-    limactl stop "$VM_NAME" 2>/dev/null || echo "VM is not running."
+    if [[ "$force" == "force" ]]; then
+        limactl stop -f "$VM_NAME" 2>/dev/null || echo "VM is not running."
+    else
+        limactl stop "$VM_NAME" 2>/dev/null || echo "VM is not running."
+    fi
+}
+
+stop() {
+    local force=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--force) force=true ;;
+            *) echo "Error: unknown option for stop: $1" >&2; exit 1 ;;
+        esac
+        shift
+    done
+    if [[ "$force" == "true" ]]; then
+        abort
+        run_locked vm_stop force
+    else
+        run_locked vm_stop
+    fi
 }
 
 restart() {
-    stop
+    vm_stop
     start
+}
+
+# Apply the "vm" config section to an existing VM. CPUs/memory/disk changes
+# need a restart; swap/swappiness are applied live in the guest.
+vm_apply() {
+    local assume_yes=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -y|--yes) assume_yes=true ;;
+            *) echo "Error: unknown option for vm-apply: $1" >&2; exit 1 ;;
+        esac
+        shift
+    done
+
+    check_lima
+    check_jq
+    validate_vm_config
+
+    local inst
+    inst=$(limactl list --json 2>/dev/null | jq -c --arg n "$VM_NAME" 'select(.name == $n)' | head -n 1)
+    if [[ -z "$inst" ]]; then
+        echo "Error: VM '$VM_NAME' does not exist. Run 'vmvpn start' first." >&2
+        exit 1
+    fi
+
+    local inst_cpus inst_mem_mib inst_disk_gib inst_status
+    inst_cpus=$(jq -r '.cpus // 0' <<<"$inst")
+    inst_mem_mib=$(jq -r '((.memory // 0) / 1048576) | round' <<<"$inst")
+    inst_disk_gib=$(jq -r '((.disk // 0) / 1073741824) | round' <<<"$inst")
+    inst_status=$(jq -r '.status // "Unknown"' <<<"$inst")
+
+    if [[ -n "$VM_CFG_DISK_GIB" ]] && (( VM_CFG_DISK_GIB < inst_disk_gib )); then
+        echo "Error: disk cannot shrink (configured ${VM_CFG_DISK_GIB}GiB < current ${inst_disk_gib}GiB)." >&2
+        exit 1
+    fi
+
+    # Only keys set in the config are managed; unset keys keep the instance's
+    # current value and never trigger a restart.
+    local needs_restart=false
+    [[ -n "$VM_CFG_CPUS" && "$VM_CFG_CPUS" != "$inst_cpus" ]] && needs_restart=true
+    [[ -n "$VM_CFG_MEMORY_MIB" && "$VM_CFG_MEMORY_MIB" != "$inst_mem_mib" ]] && needs_restart=true
+    [[ -n "$VM_CFG_DISK_GIB" && "$VM_CFG_DISK_GIB" != "$inst_disk_gib" ]] && needs_restart=true
+
+    if [[ "$needs_restart" == "true" ]]; then
+        if [[ "$assume_yes" != "true" && ! -t 0 ]]; then
+            echo "Error: applying cpus/memory/disk requires a VM restart; re-run with -y." >&2
+            exit 1
+        fi
+        if [[ "$assume_yes" != "true" ]]; then
+            read -p "The VM will restart and the VPN will disconnect. Continue? [y/N] " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                echo "Cancelled."
+                return 0
+            fi
+        fi
+        local was_running=false
+        [[ "$inst_status" == "Running" ]] && was_running=true
+        if [[ "$was_running" == "true" ]]; then
+            if limactl shell "$VM_NAME" -- timeout -k 5 30 \
+                /opt/forticlient/forticlient-cli vpn status 2>/dev/null | grep -q "Status: Connected"; then
+                echo "Disconnecting VPN..."
+                if [[ -f "$VPN_CONFIG" ]]; then
+                    vpn_disconnect
+                else
+                    limactl shell "$VM_NAME" -- timeout -k 5 30 \
+                        /opt/forticlient/forticlient-cli vpn disconnect 2>/dev/null || true
+                fi
+            fi
+            vm_stop
+        fi
+        local edit_args=(--tty=false) desc=()
+        if [[ -n "$VM_CFG_CPUS" ]]; then
+            edit_args+=(--cpus "$VM_CFG_CPUS"); desc+=("cpus=$VM_CFG_CPUS")
+        fi
+        if [[ -n "$VM_CFG_MEMORY_MIB" ]]; then
+            local mem_gib
+            mem_gib=$(awk -v m="$VM_CFG_MEMORY_MIB" 'BEGIN{printf "%g", m/1024}')
+            edit_args+=(--memory "$mem_gib"); desc+=("memory=${VM_CFG_MEMORY_MIB}MiB")
+        fi
+        if [[ -n "$VM_CFG_DISK_GIB" ]]; then
+            edit_args+=(--disk "$VM_CFG_DISK_GIB"); desc+=("disk=${VM_CFG_DISK_GIB}GiB")
+        fi
+        echo "Applying VM resources (${desc[*]})..."
+        limactl edit "${edit_args[@]}" "$VM_NAME"
+        if [[ "$was_running" == "true" ]]; then
+            echo "Starting VM..."
+            limactl start --timeout="$START_TIMEOUT" "$VM_NAME"
+        fi
+    else
+        echo "VM resources already match the config."
+    fi
+
+    apply_guest_swap || echo "Warning: could not apply guest swap settings." >&2
+    echo "Done."
 }
 
 shell() {
@@ -184,6 +503,7 @@ status() {
 # or the config file is missing (reported via exists/valid flags).
 status_json() {
     check_jq
+    read_vm_config
 
     # --- Operation lock state (some other vmvpn command is acting) ---
     local busy=false
@@ -215,6 +535,38 @@ status_json() {
     local vm_running=false
     [[ $(jq -r '.status' <<<"$vm_obj") == "Running" ]] && vm_running=true
 
+    # --- Pending restart: a managed cpus/memory/disk key differs from the
+    # instance. Unset (unmanaged) keys never count. ---
+    local vm_pending_restart=false
+    if [[ -n "$vm_json" ]]; then
+        local i_cpus i_mem i_disk
+        i_cpus=$(jq -r '.cpus // empty' <<<"$vm_json")
+        i_mem=$(jq -r '.memory // empty' <<<"$vm_json")
+        i_disk=$(jq -r '.disk // empty' <<<"$vm_json")
+        if [[ -n "$VM_CFG_CPUS" && "$i_cpus" =~ ^[0-9]+$ ]] \
+           && (( i_cpus != 10#$VM_CFG_CPUS )); then
+            vm_pending_restart=true
+        fi
+        if [[ -n "$VM_CFG_MEMORY_MIB" && "$i_mem" =~ ^[0-9]+$ ]] \
+           && (( i_mem != 10#$VM_CFG_MEMORY_MIB * 1048576 )); then
+            vm_pending_restart=true
+        fi
+        if [[ -n "$VM_CFG_DISK_GIB" && "$i_disk" =~ ^[0-9]+$ ]] \
+           && (( i_disk != 10#$VM_CFG_DISK_GIB * 1073741824 )); then
+            vm_pending_restart=true
+        fi
+    fi
+    local vm_cfg_json
+    vm_cfg_json=$(jq -nc \
+        --arg c "$VM_CFG_CPUS" --arg m "$VM_CFG_MEMORY_MIB" \
+        --arg d "$VM_CFG_DISK_GIB" --arg s "$VM_CFG_SWAP_MIB" \
+        --arg sw "$VM_CFG_SWAPPINESS" \
+        '{cpus: (if $c == "" then null else ($c | tonumber? // null) end),
+          memory_mib: (if $m == "" then null else ($m | tonumber? // null) end),
+          disk_gib: (if $d == "" then null else ($d | tonumber? // null) end),
+          swap_mib: (if $s == "" then null else ($s | tonumber? // null) end),
+          swappiness: (if $sw == "" then null else ($sw | tonumber? // null) end)}')
+
     # --- Guest: one shell call for VPN status, memory and squid, split by markers ---
     local guest_json="null" squid_active=false
     local vpn_state="disconnected" vpn_raw=""
@@ -222,7 +574,7 @@ status_json() {
         local guest_out="" guest_rc=0
         guest_out=$(limactl shell "$VM_NAME" -- sh -c '
             echo ::VMVPN_VPN_STATUS::
-            /opt/forticlient/forticlient-cli vpn status 2>&1 || true
+            timeout -k 5 15 /opt/forticlient/forticlient-cli vpn status 2>&1 || true
             echo ::VMVPN_FREE::
             free -b 2>/dev/null || true
             echo ::VMVPN_SQUID::
@@ -310,6 +662,8 @@ status_json() {
         --arg ver "$VMVPN_VERSION" \
         --argjson busy "$busy" \
         --argjson vm "$vm_obj" \
+        --argjson vmConfig "$vm_cfg_json" \
+        --argjson vmPendingRestart "$vm_pending_restart" \
         --argjson guest "$guest_json" \
         --arg vpnState "$vpn_state" \
         --arg vpnRaw "$vpn_raw" \
@@ -333,6 +687,8 @@ status_json() {
             version: $ver,
             busy: $busy,
             vm: $vm,
+            vm_config: $vmConfig,
+            vm_pending_restart: $vmPendingRestart,
             guest: $guest,
             vpn: {state: $vpnState, raw: $vpnRaw},
             proxies: {
@@ -356,15 +712,22 @@ status_json() {
 }
 
 delete() {
-    local assume_yes=false
+    local assume_yes=false force=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -y|--yes) assume_yes=true ;;
+            -f|--force) force=true; assume_yes=true ;;
             *) echo "Error: unknown option for delete: $1" >&2; exit 1 ;;
         esac
         shift
     done
 
+    [[ "$force" == "true" ]] && abort
+    run_locked delete_impl "$assume_yes"
+}
+
+delete_impl() {
+    local assume_yes="$1"
     check_lima
     if [[ "$assume_yes" != "true" && ! -t 0 ]]; then
         echo "Error: cannot confirm deletion non-interactively. Re-run with -y to proceed." >&2
@@ -562,6 +925,7 @@ ensure_vm_running() {
         echo "Starting VM..."
         limactl start --timeout="$START_TIMEOUT" "$VM_NAME"
     fi
+    apply_guest_swap || echo "Warning: could not apply guest swap settings." >&2
 }
 
 vpn_connect() {
@@ -680,7 +1044,7 @@ expect {
         check_certificate_fingerprint "$cert_fingerprint" "$trust_fingerprint" || cert_rc=$?
         if [[ $cert_rc -ne 0 ]]; then
             # Disconnect the stuck connection from the first attempt before giving up
-            limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn disconnect 2>/dev/null || true
+            limactl shell "$VM_NAME" -- timeout -k 5 30 /opt/forticlient/forticlient-cli vpn disconnect 2>/dev/null || true
             exit "$cert_rc"
         fi
 
@@ -688,14 +1052,14 @@ expect {
 
     if [[ -n "$cert_fingerprint" ]] && ! grep -q 'CERT_ACCEPTED::' <<<"$connect_output"; then
         # Disconnect the stuck connection from first attempt before reconnecting
-        limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn disconnect >/dev/null 2>&1 || true
+        limactl shell "$VM_NAME" -- timeout -k 5 30 /opt/forticlient/forticlient-cli vpn disconnect >/dev/null 2>&1 || true
 
         # Wait until the tunnel is actually down (up to 15 seconds)
         local max_wait=15
         local waited=0
         while (( waited < max_wait )); do
             local status_check
-            status_check=$(limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn status 2>&1 || true)
+            status_check=$(limactl shell "$VM_NAME" -- timeout -k 5 30 /opt/forticlient/forticlient-cli vpn status 2>&1 || true)
             if ! echo "$status_check" | grep -qi "Status: Connected\|tunnel.*active"; then
                 break
             fi
@@ -743,7 +1107,7 @@ expect {
     # Verify VPN is actually connected
     sleep 2
     local vpn_status
-    vpn_status=$(limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn status 2>&1 || true)
+    vpn_status=$(limactl shell "$VM_NAME" -- timeout -k 5 30 /opt/forticlient/forticlient-cli vpn status 2>&1 || true)
 
     if ! echo "$vpn_status" | grep -q "Status: Connected"; then
         echo ""
@@ -774,7 +1138,7 @@ vpn_disconnect() {
     stop_proxies
     
     echo "Disconnecting from VPN..."
-    limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn disconnect 2>/dev/null || true
+    limactl shell "$VM_NAME" -- timeout -k 5 30 /opt/forticlient/forticlient-cli vpn disconnect 2>/dev/null || true
     echo "VPN disconnected."
 }
 
@@ -783,7 +1147,7 @@ vpn_status() {
     check_lima
 
     echo "VPN:"
-    limactl shell "$VM_NAME" -- /opt/forticlient/forticlient-cli vpn status 2>/dev/null | sed 's/^/  /' || echo "  Not connected"
+    limactl shell "$VM_NAME" -- timeout -k 5 30 /opt/forticlient/forticlient-cli vpn status 2>/dev/null | sed 's/^/  /' || echo "  Not connected"
 
     show_proxy_status
 }
@@ -825,8 +1189,17 @@ password_set() {
         exit 1
     fi
 
-    printf '%s' "$pw" | secret-tool store --label="vmvpn: $VPN_USERNAME@$VPN_GATEWAY" \
-        service vmvpn gateway "$VPN_GATEWAY" username "$VPN_USERNAME"
+    if ! printf '%s' "$pw" | timeout 120 secret-tool store --label="vmvpn: $VPN_USERNAME@$VPN_GATEWAY" \
+        service vmvpn gateway "$VPN_GATEWAY" username "$VPN_USERNAME"; then
+        echo "Error: failed to store the password in GNOME keyring." >&2
+        exit 1
+    fi
+    local stored
+    stored=$(timeout 10 secret-tool lookup service vmvpn gateway "$VPN_GATEWAY" username "$VPN_USERNAME" 2>/dev/null || true)
+    if [[ "$stored" != "$pw" ]]; then
+        echo "Error: keyring verification failed; the stored password could not be read back." >&2
+        exit 1
+    fi
     echo "Password stored in GNOME keyring for $VPN_USERNAME@$VPN_GATEWAY."
 }
 
@@ -850,9 +1223,26 @@ cert_forget() {
     fi
 }
 
+# Launch the GUI settings window, detached.
+open_settings() {
+    local win="" c
+    for c in "$SCRIPT_DIR/gui/vmvpn-window" "$SCRIPT_DIR/vmvpn-window"; do
+        if [[ -x "$c" ]]; then win="$c"; break; fi
+    done
+    if [[ -z "$win" ]]; then
+        win=$(command -v vmvpn-window 2>/dev/null || true)
+    fi
+    if [[ -z "$win" || ! -x "$win" ]]; then
+        echo "Error: vmvpn-window not found (install the GUI, see README)." >&2
+        exit 1
+    fi
+    setsid "$win" --page settings >/dev/null 2>&1 &
+    echo "Opening VM VPN settings..."
+}
+
 logs() {
     local source="${1:-}"
-    local lines=200
+    local lines=200 follow=false
     if [[ $# -gt 0 ]]; then
         shift
     fi
@@ -866,6 +1256,10 @@ logs() {
                 lines="$2"
                 shift 2
                 ;;
+            -f|--follow)
+                follow=true
+                shift
+                ;;
             *)
                 echo "Error: unknown option for logs: $1" >&2
                 exit 1
@@ -874,14 +1268,14 @@ logs() {
     done
 
     case "$source" in
-        journal|squid|forticlient) ;;
+        journal|squid|forticlient|vpn) ;;
         ""|-h|--help)
-            echo "Usage: vmvpn logs {journal|squid|forticlient} [-n N]" >&2
+            echo "Usage: vmvpn logs {vpn|journal|squid|forticlient} [-n N] [-f]" >&2
             exit 1
             ;;
         *)
-            echo "Error: unknown log source: $source" >&2
-            echo "Sources: journal, squid, forticlient" >&2
+            echo "Error: unknown option for logs: $source" >&2
+            echo "Sources: vpn, journal, squid, forticlient" >&2
             exit 1
             ;;
     esac
@@ -890,6 +1284,26 @@ logs() {
     if ! limactl list 2>/dev/null | awk -v n="$VM_NAME" '$1 == n && $2 == "Running" { found=1 } END { exit !found }'; then
         echo "Error: VM '$VM_NAME' is not running." >&2
         exit 1
+    fi
+
+    if [[ "$follow" == "true" ]]; then
+        # Wrap the remote follower in sh: when the local process dies, stdin
+        # reaches EOF, `cat` exits and the remote tail/journalctl is killed —
+        # no orphaned followers left in the guest.
+        local remote_cmd
+        case "$source" in
+            journal)
+                remote_cmd="journalctl -f -n $lines --no-pager" ;;
+            squid)
+                remote_cmd="tail -n $lines -F /var/log/squid/cache.log /var/log/squid/access.log" ;;
+            forticlient)
+                remote_cmd="tail -n $lines -F /var/log/forticlient/sslvpn.log /var/log/forticlient/firewall.log /var/log/forticlient/confighandler.log /var/log/forticlient/fctsched.log" ;;
+            vpn)
+                remote_cmd="tail -n $lines -F /var/log/forticlient/sslvpn.log /var/log/forticlient/fctsched.log" ;;
+        esac
+        limactl shell "$VM_NAME" -- sudo sh -c \
+            "$remote_cmd & p=\$!; cat >/dev/null; kill \$p 2>/dev/null; wait \$p 2>/dev/null"
+        return
     fi
 
     case "$source" in
@@ -910,6 +1324,16 @@ logs() {
                 for f in /var/log/forticlient/sslvpn.log \
                          /var/log/forticlient/firewall.log \
                          /var/log/forticlient/confighandler.log \
+                         /var/log/forticlient/fctsched.log; do
+                    echo "=== $f ==="
+                    tail -n '"$lines"' "$f" 2>/dev/null || echo "(missing)"
+                    echo
+                done
+            '
+            ;;
+        vpn)
+            limactl shell "$VM_NAME" -- sudo bash -c '
+                for f in /var/log/forticlient/sslvpn.log \
                          /var/log/forticlient/fctsched.log; do
                     echo "=== $f ==="
                     tail -n '"$lines"' "$f" 2>/dev/null || echo "(missing)"
@@ -1163,10 +1587,16 @@ _vmvpn_completions() {
     
     case "$prev" in
         vmvpn)
-            COMPREPLY=($(compgen -W "start stop restart shell ssh status delete logs vpn-connect vpn-disconnect vpn-status password-set password-clear cert-forget firefox firefox-profile completion" -- "$cur"))
+            COMPREPLY=($(compgen -W "start stop restart abort settings shell ssh status delete vm-apply logs vpn-connect vpn-disconnect vpn-status password-set password-clear cert-forget firefox firefox-profile completion" -- "$cur"))
             ;;
         logs)
-            COMPREPLY=($(compgen -W "journal squid forticlient -n" -- "$cur"))
+            COMPREPLY=($(compgen -W "vpn journal squid forticlient -n -f --follow" -- "$cur"))
+            ;;
+        stop)
+            COMPREPLY=($(compgen -W "-f --force" -- "$cur"))
+            ;;
+        vm-apply)
+            COMPREPLY=($(compgen -W "-y --yes" -- "$cur"))
             ;;
         completion)
             COMPREPLY=($(compgen -W "bash zsh" -- "$cur"))
@@ -1178,7 +1608,7 @@ _vmvpn_completions() {
             COMPREPLY=($(compgen -W "--password-stdin --trust-fingerprint" -- "$cur"))
             ;;
         delete)
-            COMPREPLY=($(compgen -W "-y --yes" -- "$cur"))
+            COMPREPLY=($(compgen -W "-y --yes -f --force" -- "$cur"))
             ;;
         password-set)
             COMPREPLY=($(compgen -W "--stdin" -- "$cur"))
@@ -1203,13 +1633,16 @@ _vmvpn() {
     local -a commands
     commands=(
         'start:Create and start the VM'
-        'stop:Stop the VM'
+        'stop:Stop the VM (-f: force)'
         'restart:Restart the VM'
+        'abort:Kill a stuck vmvpn operation'
+        'settings:Open the GUI settings window'
         'shell:Open a shell in the VM'
         'ssh:Connect via SSH'
         'status:Show VM status'
-        'delete:Delete the VM completely'
-        'logs:Show guest logs (journal|squid|forticlient)'
+        'delete:Delete the VM completely (-y: no prompt, -f: force)'
+        'vm-apply:Apply the vm config section to the VM'
+        'logs:Show guest logs (vpn|journal|squid|forticlient; -f follows)'
         'vpn-connect:Connect to VPN (auto-starts VM and proxies)'
         'vpn-disconnect:Disconnect from VPN (stops proxies)'
         'vpn-status:Show VPN and proxy status'
@@ -1228,14 +1661,19 @@ _vmvpn() {
         'zsh:Generate zsh completion'
     )
 
-    local -a status_opts vpn_connect_opts delete_opts password_set_opts logs_opts
+    local -a status_opts vpn_connect_opts delete_opts password_set_opts logs_opts stop_opts vm_apply_opts
     status_opts=('--json:Machine-readable JSON output')
     logs_opts=(
+        'vpn:FortiClient VPN connection logs'
         'journal:systemd journal'
         'squid:Squid proxy logs'
         'forticlient:FortiClient VPN logs'
         '-n:Number of lines (default 200)'
+        '-f:Follow the log'
+        '--follow:Follow the log'
     )
+    stop_opts=('-f:Force stop after aborting stuck operations' '--force:Force stop')
+    vm_apply_opts=('-y:Apply without confirmation' '--yes:Apply without confirmation')
     vpn_connect_opts=(
         '--password-stdin:Read VPN password from stdin'
         '--trust-fingerprint:Trust the presented certificate fingerprint'
@@ -1243,6 +1681,8 @@ _vmvpn() {
     delete_opts=(
         '-y:Skip confirmation prompt'
         '--yes:Skip confirmation prompt'
+        '-f:Abort stuck ops and delete without confirmation'
+        '--force:Abort stuck ops and delete without confirmation'
     )
     password_set_opts=('--stdin:Read password from stdin')
 
@@ -1255,6 +1695,12 @@ _vmvpn() {
             ;;
         vpn-connect)
             _describe 'option' vpn_connect_opts
+            ;;
+        stop)
+            _describe 'option' stop_opts
+            ;;
+        vm-apply)
+            _describe 'option' vm_apply_opts
             ;;
         delete)
             _describe 'option' delete_opts
@@ -1295,10 +1741,16 @@ case "${1:-}" in
         run_locked start
         ;;
     stop)
-        run_locked stop
+        stop "${@:2}"
         ;;
     restart)
         run_locked restart
+        ;;
+    abort)
+        abort
+        ;;
+    settings)
+        open_settings
         ;;
     shell)
         shell
@@ -1314,7 +1766,10 @@ case "${1:-}" in
         esac
         ;;
     delete)
-        run_locked delete "${@:2}"
+        delete "${@:2}"
+        ;;
+    vm-apply)
+        run_locked vm_apply "${@:2}"
         ;;
     logs)
         logs "${@:2}"

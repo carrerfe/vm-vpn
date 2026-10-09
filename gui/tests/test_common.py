@@ -110,6 +110,7 @@ class FlowTestCase(unittest.TestCase):
         os.environ["XDG_STATE_HOME"] = os.path.join(self.tmp, "state")
         os.environ["XDG_CONFIG_HOME"] = os.path.join(self.tmp, "config")
         self.done = None  # (rc, stdout, stderr)
+        self.warnings = []
 
     def tearDown(self):
         for name, value in self._saved_env.items():
@@ -127,6 +128,7 @@ class FlowTestCase(unittest.TestCase):
             ask_trust or (lambda new, saved, cb: cb(False)),
             self._on_done,
             password=password,
+            on_warning=self.warnings.append,
         )
         flow.start()
         drive(lambda: self.done is not None)
@@ -233,6 +235,40 @@ class TestConnectFlow(FlowTestCase):
         self.assertEqual(self.done[0], 0)
         self.assertEqual(self.stub.call_count(), 2)
         self.assertNotIn("password-set", " ".join(self.stub.calls()))
+
+    def test_remember_saves_on_generic_failure(self):
+        """rc=1 (not login failure) still saves a 'remembered' password."""
+        self.stub.add_step(rc=4)
+        self.stub.add_step(rc=1, err="VPN connection failed\n")
+        self.stub.add_step(rc=0)  # password-set
+        self.run_flow(ask_password=lambda msg, cb: cb("pw", True))
+        self.assertEqual(self.done[0], 1)
+        self.assertEqual(self.stub.calls()[2], "password-set --stdin")
+
+    def test_remember_skipped_on_login_failed(self):
+        """rc=2 never stores the (bad) password."""
+        self.stub.add_step(rc=4)
+        self.stub.add_step(rc=2, out="Login failed\n")
+        asks = iter([
+            ("pw", True),
+            (None, False),  # user cancels the re-prompt
+        ])
+
+        def ask(msg, cb):
+            pw, remember = next(asks)
+            cb(pw, remember)
+
+        self.run_flow(ask_password=ask)
+        self.assertEqual(self.done[0], 2)
+        self.assertNotIn("password-set", " ".join(self.stub.calls()))
+
+    def test_password_set_failure_calls_on_warning(self):
+        self.stub.add_step(rc=4)
+        self.stub.add_step(rc=0)  # connect OK
+        self.stub.add_step(rc=1, err="keyring is locked\n")
+        self.run_flow(ask_password=lambda msg, cb: cb("pw", True))
+        self.assertEqual(self.done[0], 0)
+        self.assertEqual(self.warnings, ["keyring is locked"])
 
     def test_password_prompt_cap(self):
         for _ in range(5):
@@ -412,8 +448,11 @@ class TestConfigHelpers(FlowTestCase):
         with open(example_path, encoding="utf-8") as f:
             example = json.load(f)
         example.pop("password", None)
+        # The vm block is not part of the defaults: unmanaged keys stay absent.
+        example.pop("vm", None)
         self.assertEqual(cfg, example)
         self.assertNotIn("password", cfg)
+        self.assertNotIn("vm", cfg)
 
     def test_load_invalid_returns_defaults(self):
         path = self._cfg_path()
@@ -444,6 +483,38 @@ class TestConfigHelpers(FlowTestCase):
         # 2-space indentation and trailing newline
         self.assertTrue(text.endswith("}\n"))
         self.assertIn('\n  "gateway"', text)
+
+    def test_update_vm_config_untouched_rows_stay_absent(self):
+        cfg = {"gateway": "g.example.com"}
+        values = {"cpus": 2, "memory_mib": 512, "disk_gib": 20,
+                  "swap_mib": 0, "swappiness": None}
+        written = vc.update_vm_config(cfg, values, set())
+        self.assertEqual(written, set())
+        self.assertNotIn("vm", cfg)
+
+    def test_update_vm_config_writes_only_managed_or_touched(self):
+        cfg = {"vm": {"cpus": 2, "swap_mib": 1024}}
+        values = {"cpus": 4, "memory_mib": 768, "disk_gib": 20,
+                  "swap_mib": 0, "swappiness": None}
+        written = vc.update_vm_config(cfg, values, {"memory_mib"})
+        self.assertEqual(written, {"cpus", "swap_mib", "memory_mib"})
+        self.assertEqual(cfg["vm"]["cpus"], 4)
+        self.assertEqual(cfg["vm"]["swap_mib"], 0)
+        self.assertEqual(cfg["vm"]["memory_mib"], 768)
+        self.assertNotIn("disk_gib", cfg["vm"])
+        self.assertNotIn("swappiness", cfg["vm"])
+
+    def test_update_vm_config_null_value_stays_unmanaged(self):
+        cfg = {"vm": {"swappiness": None}}
+        written = vc.update_vm_config(cfg, {"swappiness": 100}, set())
+        self.assertEqual(written, set())
+        self.assertIsNone(cfg["vm"]["swappiness"])
+
+    def test_update_vm_config_touched_swappiness_off_writes_null(self):
+        cfg = {"vm": {"swappiness": 100}}
+        vc.update_vm_config(cfg, {"swappiness": None}, {"swappiness"})
+        self.assertIn("swappiness", cfg["vm"])
+        self.assertIsNone(cfg["vm"]["swappiness"])
 
     def test_save_mode_0600_and_atomic_replace(self):
         path = self._cfg_path()

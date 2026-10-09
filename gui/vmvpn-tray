@@ -2,6 +2,7 @@
 """vmvpn tray icon - GTK3 + AyatanaAppIndicator3 (SNI, works on GNOME/KDE)."""
 
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -13,7 +14,7 @@ import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("AyatanaAppIndicator3", "0.1")
 from gi.repository import AyatanaAppIndicator3 as AppIndicator
-from gi.repository import Gdk, Gio, GLib, Gtk
+from gi.repository import Gio, GLib, Gtk
 
 import vmvpn_common as vc
 
@@ -26,14 +27,20 @@ except (ImportError, ValueError):
     _NOTIFY_OK = False
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+ICON_DIR = os.path.join(SCRIPT_DIR, "icons")
 POLL_INTERVAL_SECONDS = 10
 
-ICON_CONNECTED = "network-vpn-symbolic"
-ICON_ACQUIRING = "network-vpn-acquiring-symbolic"
-ICON_DISCONNECTED = "network-vpn-disconnected-symbolic"
-ICON_DISABLED = "network-vpn-disabled-symbolic"
-ICON_NO_ROUTE = "network-vpn-no-route-symbolic"
-ICON_FALLBACK = "network-vpn"
+# Own full-colour icons shipped in gui/icons/ (installed next to this script):
+# theme symbolic names are not reliable across desktops (shows "?").
+ICON_CONNECTED = "vmvpn-connected"
+ICON_ACQUIRING = "vmvpn-connecting"
+ICON_DISCONNECTED = "vmvpn-disconnected"
+ICON_DISABLED = "vmvpn-off"
+ICON_NO_ROUTE = "vmvpn-error"
+
+
+def _icon_path(name):
+    return os.path.join(ICON_DIR, name + ".svg")
 
 
 class TrayApp:
@@ -68,6 +75,7 @@ class TrayApp:
             ICON_DISABLED,
             AppIndicator.IndicatorCategory.APPLICATION_STATUS,
         )
+        self.indicator.set_icon_theme_path(ICON_DIR)
         self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
         self.indicator.set_title("VM VPN")
         app.hold()
@@ -101,9 +109,6 @@ class TrayApp:
 
     def _cfg(self):
         return (self.status or {}).get("config") or {}
-
-    def _proxies(self):
-        return (self.status or {}).get("proxies") or {}
 
     def _vm_running(self):
         return self._vm().get("status") == "Running"
@@ -164,18 +169,14 @@ class TrayApp:
 
     def _icon_name(self):
         if self._busy():
-            name = ICON_ACQUIRING
-        elif self.last_failed or self.status is None:
-            name = ICON_NO_ROUTE
-        elif self._connected():
-            name = ICON_CONNECTED
-        elif self._config_valid() and self._vm_running():
-            name = ICON_DISCONNECTED
-        else:
-            name = ICON_DISABLED
-        if not Gtk.IconTheme.get_default().has_icon(name):
-            name = ICON_FALLBACK
-        return name
+            return ICON_ACQUIRING
+        if self.last_failed or self.status is None:
+            return ICON_NO_ROUTE
+        if self._connected():
+            return ICON_CONNECTED
+        if self._config_valid() and self._vm_running():
+            return ICON_DISCONNECTED
+        return ICON_DISABLED
 
     def _header_text(self):
         if self.action == "connect":
@@ -186,16 +187,14 @@ class TrayApp:
             return "Status unavailable"
         if not self._config_valid():
             return "Not configured"
-        if not self._vm().get("exists"):
-            return "VM not created"
-        if not self._vm_running():
+        if not self._vm().get("exists") or not self._vm_running():
             return "VM stopped"
         if self._connected():
             gateway = self._cfg().get("gateway")
             if gateway:
-                return "VPN: Connected — %s" % gateway
-            return "VPN: Connected"
-        return "VPN: Disconnected"
+                return "Connected — %s" % gateway
+            return "Connected"
+        return "Disconnected"
 
     def _refresh_ui(self):
         icon = self._icon_name()
@@ -210,50 +209,24 @@ class TrayApp:
         item.show()
         return item
 
+    def _window_path(self):
+        sibling = os.path.join(SCRIPT_DIR, "vmvpn-window")
+        if os.path.isfile(sibling) and os.access(sibling, os.X_OK):
+            return sibling
+        return shutil.which("vmvpn-window")
+
     def _menu_signature(self):
         """Tuple describing the menu model; rebuild only when it changes."""
         busy = self._busy()
         connected = self._connected()
-        proxies = self._proxies()
-        socks = proxies.get("socks") or {}
-        http = proxies.get("http") or {}
-
-        proxy_line = None
-        if connected:
-            parts = []
-            if socks.get("enabled") and socks.get("running"):
-                parts.append("SOCKS 127.0.0.1:%s" % socks.get("port"))
-            if http.get("enabled") and http.get("running"):
-                parts.append("HTTP 127.0.0.1:%s" % http.get("port"))
-            if parts:
-                proxy_line = " · ".join(parts)
-
-        window_bin = os.path.join(SCRIPT_DIR, "vmvpn-window")
-        window_visible = os.path.isfile(window_bin) and os.access(
-            window_bin, os.X_OK
-        )
-
         return (
             self._header_text(),
-            proxy_line,
             "Disconnect" if connected else "Connect",
             not busy and (connected or self._config_valid()),
-            not busy and connected,                      # firefox
-            bool(socks.get("enabled")), not busy,        # copy socks
-            bool(http.get("enabled")),                   # copy http
-            "Stop VM" if self._vm_running() else "Start VM",
-            not busy,
-            window_visible,
-            vc.autostart_enabled(), not busy,
-            self._version_label(),
+            not busy and connected,                        # firefox
+            self._window_path() is not None,               # status/settings
+            (self.status or {}).get("version"),            # about comments
         )
-
-    def _version_label(self):
-        label = "VM VPN %s" % vc.VERSION
-        cli_version = (self.status or {}).get("version")
-        if cli_version and cli_version != vc.VERSION:
-            label += " (CLI %s)" % cli_version
-        return label
 
     def _rebuild_menu(self):
         sig = self._menu_signature()
@@ -263,30 +236,17 @@ class TrayApp:
 
         menu = Gtk.Menu()
         busy = self._busy()
+        connected = self._connected()
 
-        header = Gtk.MenuItem(label=self._header_text())
-        header.set_sensitive(False)
-        header.show()
-        menu.append(header)
-
-        if self._connected():
-            proxies = self._proxies()
-            socks = proxies.get("socks") or {}
-            http = proxies.get("http") or {}
-            parts = []
-            if socks.get("enabled") and socks.get("running"):
-                parts.append("SOCKS 127.0.0.1:%s" % socks.get("port"))
-            if http.get("enabled") and http.get("running"):
-                parts.append("HTTP 127.0.0.1:%s" % http.get("port"))
-            if parts:
-                proxy_line = Gtk.MenuItem(label=" · ".join(parts))
-                proxy_line.set_sensitive(False)
-                proxy_line.show()
-                menu.append(proxy_line)
+        status_item = Gtk.MenuItem(label=self._header_text())
+        status_item.set_sensitive(self._window_path() is not None)
+        status_item.connect("activate", self._on_open_status)
+        status_item.show()
+        menu.append(status_item)
 
         menu.append(self._sep())
 
-        if self._connected():
+        if connected:
             conn_item = Gtk.MenuItem(label="Disconnect")
             conn_item.connect("activate", self._on_disconnect)
             conn_item.set_sensitive(not busy)
@@ -298,67 +258,23 @@ class TrayApp:
         menu.append(conn_item)
 
         firefox_item = Gtk.MenuItem(label="Launch VPN Firefox")
-        firefox_item.set_sensitive(not busy and self._connected())
+        firefox_item.set_sensitive(not busy and connected)
         firefox_item.connect("activate", self._on_firefox)
         firefox_item.show()
         menu.append(firefox_item)
 
-        proxies = self._proxies()
-        socks = proxies.get("socks") or {}
-        http = proxies.get("http") or {}
-        if socks.get("enabled"):
-            item = Gtk.MenuItem(label="Copy SOCKS proxy address")
-            item.connect(
-                "activate",
-                lambda *_: self._copy_to_clipboard(
-                    "socks5h://127.0.0.1:%s" % socks.get("port", 1080)
-                ),
-            )
-            item.set_sensitive(not busy)
-            item.show()
-            menu.append(item)
-        if http.get("enabled"):
-            item = Gtk.MenuItem(label="Copy HTTP proxy address")
-            item.connect(
-                "activate",
-                lambda *_: self._copy_to_clipboard(
-                    "http://127.0.0.1:%s" % http.get("port", 3128)
-                ),
-            )
-            item.set_sensitive(not busy)
-            item.show()
-            menu.append(item)
-
         menu.append(self._sep())
 
-        vm_item = Gtk.MenuItem(label="Stop VM" if self._vm_running() else "Start VM")
-        vm_item.set_sensitive(not busy)
-        vm_item.connect("activate", self._on_vm_toggle)
-        vm_item.show()
-        menu.append(vm_item)
+        settings_item = Gtk.MenuItem(label="Settings…")
+        settings_item.set_sensitive(self._window_path() is not None)
+        settings_item.connect("activate", self._on_open_settings)
+        settings_item.show()
+        menu.append(settings_item)
 
-        menu.append(self._sep())
-
-        window_bin = os.path.join(SCRIPT_DIR, "vmvpn-window")
-        if os.path.isfile(window_bin) and os.access(window_bin, os.X_OK):
-            open_item = Gtk.MenuItem(label="Open VM VPN…")
-            open_item.connect(
-                "activate", lambda *_: self._spawn_detached(window_bin)
-            )
-            open_item.show()
-            menu.append(open_item)
-
-        autostart_item = Gtk.CheckMenuItem(label="Start at login")
-        autostart_item.set_active(vc.autostart_enabled())
-        autostart_item.set_sensitive(not busy)
-        autostart_item.connect("toggled", self._on_autostart_toggled)
-        autostart_item.show()
-        menu.append(autostart_item)
-
-        version_item = Gtk.MenuItem(label=self._version_label())
-        version_item.set_sensitive(False)
-        version_item.show()
-        menu.append(version_item)
+        about_item = Gtk.MenuItem(label="About VM VPN")
+        about_item.connect("activate", self._on_about)
+        about_item.show()
+        menu.append(about_item)
 
         quit_item = Gtk.MenuItem(label="Quit")
         quit_item.connect("activate", self._on_quit_item)
@@ -383,9 +299,17 @@ class TrayApp:
         self.action = "connect"
         self._refresh_ui()
         self.flow = vc.ConnectFlow(
-            self._ask_password, self._ask_trust, self._connect_done
+            self._ask_password,
+            self._ask_trust,
+            self._connect_done,
+            on_warning=self._on_keyring_warning,
         )
         self.flow.start()
+
+    def _on_keyring_warning(self, message):
+        self._notify(
+            "Could not save password to keyring", message, ICON_NO_ROUTE
+        )
 
     def _connect_done(self, rc, stdout, stderr):
         self.flow = None
@@ -411,11 +335,28 @@ class TrayApp:
     def _on_firefox(self, *_args):
         self._run_action("firefox", ["firefox"])
 
-    def _on_vm_toggle(self, *_args):
-        if self._vm_running():
-            self._run_action("stop", ["stop"])
-        else:
-            self._run_action("start", ["start"])
+    def _on_open_status(self, *_args):
+        self._open_window("status")
+
+    def _on_open_settings(self, *_args):
+        self._open_window("settings")
+
+    def _open_window(self, page):
+        win = self._window_path()
+        if win is not None:
+            self._spawn_detached(win, "--page", page)
+
+    def _on_about(self, *_args):
+        dialog = Gtk.AboutDialog()
+        dialog.set_program_name("VM VPN")
+        dialog.set_version(vc.VERSION)
+        cli_version = (self.status or {}).get("version")
+        if cli_version and cli_version != vc.VERSION:
+            dialog.set_comments("CLI %s" % cli_version)
+        dialog.set_website("https://github.com/carrerfe/vm-vpn")
+        dialog.set_license_type(Gtk.License.MIT_X11)
+        dialog.connect("response", lambda d, *_: d.destroy())
+        dialog.show()
 
     def _run_action(self, action, args):
         if self._busy():
@@ -441,10 +382,10 @@ class TrayApp:
         vc.run_cli(args, done)
 
     @staticmethod
-    def _spawn_detached(path):
+    def _spawn_detached(path, *args):
         try:
             subprocess.Popen(
-                [path],
+                [path, *args],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -453,17 +394,6 @@ class TrayApp:
             )
         except OSError:
             pass
-
-    @staticmethod
-    def _copy_to_clipboard(text):
-        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-        clipboard.set_text(text, -1)
-        clipboard.store()
-
-    # -- autostart ---------------------------------------------------------------
-
-    def _on_autostart_toggled(self, item):
-        vc.set_autostart(item.get_active(), os.path.realpath(__file__))
 
     # -- dialogs -------------------------------------------------------------------
 
@@ -573,9 +503,10 @@ class TrayApp:
     # -- notifications -------------------------------------------------------------
 
     def _notify(self, summary, body="", icon=ICON_CONNECTED):
+        icon_ref = icon if "/" in icon else _icon_path(icon)
         if _NOTIFY_OK:
             try:
-                notification = Notify.Notification.new(summary, body, icon)
+                notification = Notify.Notification.new(summary, body, icon_ref)
                 notification.show()
                 return
             except Exception:
