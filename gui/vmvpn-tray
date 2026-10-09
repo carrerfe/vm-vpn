@@ -56,6 +56,7 @@ class TrayApp:
         self.status = None            # latest parsed `status --json` or None
         self.action = None            # None | "connect" | other action label
         self.action_running = False
+        self.action_phase = ""        # latest '==> ' line while running
         self.flow = None
         self.last_failed = False
         self.poll_in_flight = False
@@ -179,14 +180,15 @@ class TrayApp:
         return ICON_DISABLED
 
     def _header_text(self):
+        phase = getattr(self, "action_phase", "") or ""
         if self.action == "connect":
-            return "Connecting…"
+            return phase or "Connecting…"
         if self._busy():
-            return "Working…"
+            return phase or "Working…"
         if self.status is None:
             return "Status unavailable"
         if not self._config_valid():
-            return "Not configured"
+            return "Set up VM VPN…"
         if not self._vm().get("exists") or not self._vm_running():
             return "VM stopped"
         if self._connected():
@@ -238,9 +240,14 @@ class TrayApp:
         busy = self._busy()
         connected = self._connected()
 
+        configured = self._config_valid()
+
         status_item = Gtk.MenuItem(label=self._header_text())
         status_item.set_sensitive(self._window_path() is not None)
-        status_item.connect("activate", self._on_open_status)
+        status_item.connect(
+            "activate",
+            self._on_open_status if configured else self._on_open_setup,
+        )
         status_item.show()
         menu.append(status_item)
 
@@ -252,8 +259,13 @@ class TrayApp:
             conn_item.set_sensitive(not busy)
         else:
             conn_item = Gtk.MenuItem(label="Connect")
-            conn_item.connect("activate", self._on_connect)
-            conn_item.set_sensitive(not busy and self._config_valid())
+            conn_item.connect(
+                "activate",
+                self._on_connect if configured else self._on_open_setup,
+            )
+            conn_item.set_sensitive(
+                not busy and (configured or self._window_path() is not None)
+            )
         conn_item.show()
         menu.append(conn_item)
 
@@ -297,14 +309,27 @@ class TrayApp:
         self.user_action_pending = True
         self.action_running = True
         self.action = "connect"
+        self.action_phase = ""
+        if not self._vm().get("exists"):
+            self._notify(
+                "Creating the VM",
+                "The first connection takes 5–15 minutes.",
+                ICON_ACQUIRING,
+            )
         self._refresh_ui()
         self.flow = vc.ConnectFlow(
             self._ask_password,
             self._ask_trust,
             self._connect_done,
             on_warning=self._on_keyring_warning,
+            on_line=self._on_action_line,
         )
         self.flow.start()
+
+    def _on_action_line(self, line):
+        if line.startswith("==> "):
+            self.action_phase = line[4:]
+            self._refresh_ui()
 
     def _on_keyring_warning(self, message):
         self._notify(
@@ -315,6 +340,7 @@ class TrayApp:
         self.flow = None
         self.action_running = False
         self.action = None
+        self.action_phase = ""
         if rc == vc.EXIT_OK:
             self.last_failed = False
             self._notify("VM VPN", "VPN connected.", ICON_CONNECTED)
@@ -341,6 +367,9 @@ class TrayApp:
     def _on_open_settings(self, *_args):
         self._open_window("settings")
 
+    def _on_open_setup(self, *_args):
+        self._open_window("setup")
+
     def _open_window(self, page):
         win = self._window_path()
         if win is not None:
@@ -358,17 +387,19 @@ class TrayApp:
         dialog.connect("response", lambda d, *_: d.destroy())
         dialog.show()
 
-    def _run_action(self, action, args):
+    def _run_action(self, action, args, stream=False):
         if self._busy():
             return
         self.user_action_pending = True
         self.action_running = True
         self.action = action
+        self.action_phase = ""
         self._refresh_ui()
 
         def done(rc, stdout, stderr):
             self.action_running = False
             self.action = None
+            self.action_phase = ""
             if rc == vc.EXIT_OK:
                 self.last_failed = False
                 if action == "disconnect":
@@ -379,7 +410,9 @@ class TrayApp:
             self._refresh_ui()
             self._poll()
 
-        vc.run_cli(args, done)
+        vc.run_cli(
+            args, done, on_line=self._on_action_line if stream else None
+        )
 
     @staticmethod
     def _spawn_detached(path, *args):

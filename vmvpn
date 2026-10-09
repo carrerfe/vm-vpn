@@ -10,7 +10,7 @@ FIREFOX_PROFILE_NAME="vmvpn"
 START_TIMEOUT="30m"
 VMVPN_VERSION="1.0.0"
 
-COMMANDS="start stop restart abort settings shell ssh status delete vm-apply logs vpn-connect vpn-disconnect vpn-status password-set password-clear cert-forget firefox firefox-profile completion version"
+COMMANDS="setup start stop restart abort settings shell ssh status delete vm-apply logs vpn-connect vpn-disconnect vpn-status password-set password-clear cert-forget firefox firefox-profile completion version"
 
 usage() {
     echo "vmvpn - VM VPN CLI"
@@ -18,6 +18,7 @@ usage() {
     echo "Usage: vmvpn <command> [options]"
     echo ""
     echo "VM Commands:"
+    echo "  setup           Interactive first-time setup (VPN account + VM)"
     echo "  start           Create and start the VM"
     echo "  stop [-f]       Stop the VM (-f: abort running op, force stop)"
     echo "  restart         Restart the VM"
@@ -185,6 +186,12 @@ check_lima() {
     fi
 }
 
+# Phase marker for long-running operations. The GUI displays the latest
+# '==> ' line as its progress text; everything else is treated as detail.
+phase() {
+    echo "==> $*"
+}
+
 check_jq() {
     if ! command -v jq &> /dev/null; then
         echo "Error: jq is not installed (required to parse VPN config)."
@@ -211,7 +218,7 @@ read_vm_config() {
     VM_CFG_CPUS=""; VM_CFG_MEMORY_MIB=""; VM_CFG_DISK_GIB=""
     VM_CFG_SWAP_MIB=""; VM_CFG_SWAPPINESS=""
     if [[ -f "$VPN_CONFIG" ]] && command -v jq >/dev/null 2>&1 \
-       && jq empty "$VPN_CONFIG" 2>/dev/null; then
+       && jq -e 'type == "object"' "$VPN_CONFIG" >/dev/null 2>&1; then
         # One value per line (empty = unset): mapfile keeps empty fields,
         # which a tab-separated `read` would collapse.
         local -a vals=()
@@ -326,7 +333,7 @@ create_vm() {
         args+=(--memory "$mem_gib")
     fi
     [[ -n "$VM_CFG_DISK_GIB" ]] && args+=(--disk "$VM_CFG_DISK_GIB")
-    [[ -t 0 ]] || args+=(--tty=false)
+    args+=(--tty=false)
     if [[ -n "${VMVPN_SWAP_SIZE:-}" ]]; then
         args+=(--set ".param.SWAP_SIZE = \"$VMVPN_SWAP_SIZE\"")
     fi
@@ -338,12 +345,14 @@ create_vm() {
 
 start() {
     check_lima
+    check_vpn_config
     if limactl list -q | grep -q "^${VM_NAME}$"; then
-        echo "Starting existing VM..."
+        phase "Starting the VM…"
         limactl start --timeout="$START_TIMEOUT" "$VM_NAME"
     else
-        echo "Creating and starting VM..."
+        phase "Creating the VM (first time only: downloads Ubuntu and installs FortiClient, usually 5–15 minutes)…"
         create_vm
+        phase "Waiting for the VM to become ready…"
     fi
     apply_guest_swap || echo "Warning: could not apply guest swap settings." >&2
     echo ""
@@ -452,6 +461,7 @@ vm_apply() {
             fi
             vm_stop
         fi
+        phase "Applying VM settings (the VM will restart)…"
         local edit_args=(--tty=false) desc=()
         if [[ -n "$VM_CFG_CPUS" ]]; then
             edit_args+=(--cpus "$VM_CFG_CPUS"); desc+=("cpus=$VM_CFG_CPUS")
@@ -610,10 +620,11 @@ status_json() {
     fi
 
     # --- Config (never fatal here) ---
-    local cfg_exists=false cfg_valid=false cfg_gateway="" cfg_port="" cfg_username=""
+    local cfg_exists=false cfg_valid=false cfg_reason="missing"
+    local cfg_gateway="" cfg_port="" cfg_username=""
     local password_source="none"
     local socks_enabled=true socks_port=1080 http_enabled=false http_port=3128
-    if [[ -f "$VPN_CONFIG" ]] && jq empty "$VPN_CONFIG" 2>/dev/null; then
+    if [[ -f "$VPN_CONFIG" ]] && jq -e 'type == "object"' "$VPN_CONFIG" >/dev/null 2>&1; then
         cfg_exists=true
         socks_enabled=$(jq -r '.socks_proxy.enabled // true' "$VPN_CONFIG")
         socks_port=$(jq -r '.socks_proxy.port // 1080' "$VPN_CONFIG")
@@ -626,8 +637,14 @@ status_json() {
         cfg_password=$(jq -r '.password // empty' "$VPN_CONFIG")
         [[ "$cfg_gateway" == "null" ]] && cfg_gateway=""
         [[ "$cfg_username" == "null" ]] && cfg_username=""
-        if [[ -n "$cfg_gateway" && -n "$cfg_username" ]]; then
+        if _is_example_placeholder "$cfg_gateway" \
+           || _is_example_placeholder "$cfg_username"; then
+            cfg_reason="placeholder values"
+        elif [[ -z "$cfg_gateway" || -z "$cfg_username" ]]; then
+            cfg_reason="incomplete"
+        else
             cfg_valid=true
+            cfg_reason=""
             if [[ -n "$cfg_password" && "$cfg_password" != "null" ]]; then
                 password_source="config"
             elif command -v secret-tool >/dev/null 2>&1 && \
@@ -637,6 +654,7 @@ status_json() {
         fi
     elif [[ -f "$VPN_CONFIG" ]]; then
         cfg_exists=true
+        cfg_reason="invalid JSON"
     fi
     [[ "$socks_enabled" == "true" || "$socks_enabled" == "false" ]] || socks_enabled=true
     [[ "$http_enabled" == "true" || "$http_enabled" == "false" ]] || http_enabled=false
@@ -676,6 +694,7 @@ status_json() {
         --arg cfgPath "$VPN_CONFIG" \
         --argjson cfgExists "$cfg_exists" \
         --argjson cfgValid "$cfg_valid" \
+        --arg cfgReason "$cfg_reason" \
         --arg cfgGateway "$cfg_gateway" \
         --arg cfgPort "$cfg_port" \
         --arg cfgUsername "$cfg_username" \
@@ -699,6 +718,7 @@ status_json() {
                 path: $cfgPath,
                 exists: $cfgExists,
                 valid: $cfgValid,
+                reason: (if $cfgReason == "" then null else $cfgReason end),
                 gateway: (if $cfgValid then $cfgGateway else null end),
                 port: (if $cfgValid then ($cfgPort | tonumber? // null) else null end),
                 username: (if $cfgValid then $cfgUsername else null end),
@@ -746,27 +766,275 @@ delete_impl() {
     echo "VM deleted."
 }
 
+# Example values shipped in vpn-config.json.example. A config still
+# carrying them counts as "not set up" everywhere (CLI, status, GUI).
+_is_example_placeholder() {
+    [[ "$1" == "vpn.example.com" || "$1" == "your-username" ]]
+}
+
+# True when the config exists, is a JSON object, and has no example
+# placeholder values left in gateway/username.
+vpn_config_usable() {
+    [[ -f "$VPN_CONFIG" ]] || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    jq -e 'type == "object"' "$VPN_CONFIG" >/dev/null 2>&1 || return 1
+    ! _is_example_placeholder "$(jq -r '.gateway // empty' "$VPN_CONFIG")" \
+        && ! _is_example_placeholder "$(jq -r '.username // empty' "$VPN_CONFIG")"
+}
+
 check_vpn_config() {
+    local problem=""
     if [[ ! -f "$VPN_CONFIG" ]]; then
-        echo "Error: VPN config file not found: $VPN_CONFIG" >&2
-        echo ""
-        echo "Create a vpn-config.json file with:"
-        echo '{'
-        echo '  "gateway": "vpn.example.com",'
-        echo '  "port": 443,'
-        echo '  "username": "your-username",'
-        echo '  "password": "your-password"'
-        echo '}'
-        echo ""
-        echo "Or copy the example: cp vpn-config.json.example vpn-config.json"
-        exit 5
+        problem="missing"
+    elif command -v jq >/dev/null 2>&1 && ! jq -e 'type == "object"' "$VPN_CONFIG" >/dev/null 2>&1; then
+        problem="invalid"
+    elif ! vpn_config_usable; then
+        problem="placeholder"
     fi
+    [[ -z "$problem" ]] && return 0
+
+    if [[ -t 0 ]]; then
+        case "$problem" in
+            missing)
+                echo "No VPN profile is set up yet." ;;
+            invalid)
+                echo "The VPN config file is not valid JSON: $VPN_CONFIG" ;;
+            placeholder)
+                echo "The VPN config still has the example values; it isn't usable yet." ;;
+        esac
+        local response=""
+        read -r -p "Run setup now? [Y/n] " response || response="n"
+        if [[ -z "$response" || "$response" =~ ^[Yy] ]]; then
+            setup
+            if vpn_config_usable; then
+                return 0
+            fi
+        fi
+    fi
+
+    case "$problem" in
+        missing)
+            echo "Error: VPN config file not found: $VPN_CONFIG" >&2
+            echo "Run 'vmvpn setup' in a terminal, or open the VM VPN app." >&2 ;;
+        invalid)
+            echo "Error: VPN config file is not valid JSON: $VPN_CONFIG" >&2
+            echo "Fix it, or run 'vmvpn setup' to reconfigure." >&2 ;;
+        placeholder)
+            echo "Error: the VPN config still has the example placeholder values: $VPN_CONFIG" >&2
+            echo "Run 'vmvpn setup' to enter your real VPN account." >&2 ;;
+    esac
+    exit 5
+}
+
+# Interactive first-time setup: VPN account + proxies, then optionally the
+# VM and a first connection. Preserves unknown keys in an existing config.
+setup() {
+    if [[ ! -t 0 ]]; then
+        echo "Error: 'vmvpn setup' is interactive — run it in a terminal, or use the VM VPN app." >&2
+        exit 1
+    fi
+    check_jq
+    echo "VM VPN setup"
+    echo "============"
+    echo ""
+    echo "This configures your VPN account (server, username, password) and"
+    echo "then creates the VM that runs the VPN client."
+    echo ""
+
+    local cur_gateway="" cur_port="" cur_username=""
+    if [[ -f "$VPN_CONFIG" ]] && jq -e 'type == "object"' "$VPN_CONFIG" >/dev/null 2>&1; then
+        cur_gateway=$(jq -r '.gateway // empty' "$VPN_CONFIG")
+        cur_port=$(jq -r '.port // empty' "$VPN_CONFIG")
+        cur_username=$(jq -r '.username // empty' "$VPN_CONFIG")
+        # Example placeholder values are not real defaults.
+        _is_example_placeholder "$cur_gateway" && cur_gateway=""
+        _is_example_placeholder "$cur_username" && cur_username=""
+    fi
+
+    # --- VPN server (accepts host, host:port, or a https:// URL) ---
+    local server_input="" gateway="" parsed_port=""
+    while true; do
+        local gprompt="VPN server"
+        [[ -n "$cur_gateway" ]] && gprompt="$gprompt [$cur_gateway]"
+        read -r -p "$gprompt: " server_input
+        [[ -z "$server_input" ]] && server_input="$cur_gateway"
+        local s="$server_input"
+        s="${s#*://}"          # strip scheme
+        s="${s%%/*}"           # strip path
+        s="${s##*@}"           # strip userinfo
+        gateway="$s"; parsed_port=""
+        if [[ "$s" == *:* && "$s" != *:*:* ]]; then
+            gateway="${s%%:*}"
+            parsed_port="${s##*:}"
+        fi
+        if [[ -z "$gateway" || "$gateway" =~ [[:space:]] ]]; then
+            echo "Please enter a server name, e.g. vpn.example.com."
+            continue
+        fi
+        if [[ -n "$parsed_port" && ! "$parsed_port" =~ ^[0-9]+$ ]]; then
+            echo "Invalid port '$parsed_port'."
+            continue
+        fi
+        break
+    done
+
+    # --- port ---
+    local port="" def_port="${parsed_port:-${cur_port:-443}}"
+    read -r -p "Port [$def_port]: " port
+    [[ -z "$port" ]] && port="$def_port"
+    while ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); do
+        read -r -p "Invalid port. Port [$def_port]: " port
+        [[ -z "$port" ]] && port="$def_port"
+    done
+
+    # --- username ---
+    local username="" uprompt="Username"
+    [[ -n "$cur_username" ]] && uprompt="$uprompt [$cur_username]"
+    while [[ -z "$username" ]]; do
+        read -r -p "$uprompt: " username
+        [[ -z "$username" ]] && username="$cur_username"
+        [[ -z "$username" ]] && echo "Username is required."
+    done
+
+    # --- password ---
+    local password="" save_in_config=false save_in_keyring=false
+    read -r -s -p "Password (leave empty to be asked at each connect): " password
+    echo ""
+    if [[ -n "$password" ]]; then
+        if command -v secret-tool >/dev/null 2>&1; then
+            save_in_keyring=true
+        else
+            local rsp=""
+            read -r -p "GNOME Keyring is not available. Save the password in the config file (plain text)? [y/N] " rsp
+            if [[ "$rsp" =~ ^[Yy] ]]; then
+                save_in_config=true
+            else
+                password=""
+                echo "OK — the password will be asked at each connect."
+            fi
+        fi
+    fi
+
+    # --- SOCKS proxy on the first free port from 1080 ---
+    local socks_port=1080
+    while ! _port_is_free "$socks_port"; do
+        socks_port=$((socks_port + 1))
+    done
+    if [[ "$socks_port" != "1080" ]]; then
+        echo "Note: port 1080 is in use; the SOCKS proxy will use $socks_port."
+    fi
+
+    # --- write the config (merge into the existing file: unknown keys kept) ---
+    local tmp
+    tmp=$(mktemp) || exit 1
+    chmod 600 "$tmp"
+    local want_plaintext=false drop_password=false
+    [[ "$save_in_config" == "true" ]] && want_plaintext=true
+    [[ -n "$password" && "$save_in_config" == "false" ]] && drop_password=true
+    local jqfilter='
+        (. // {}) |
+        .gateway = $gw | .port = $port | .username = $user |
+        .socks_proxy = ((.socks_proxy // {}) + {enabled: true, port: $sp, auto_start: true, auto_stop: true}) |
+        .http_proxy = ((.http_proxy // {}) + {enabled: false}) |
+        (if $save_pw then .password = $pw
+         elif $drop_pw then del(.password)
+         else . end)'
+    if [[ -f "$VPN_CONFIG" ]] && jq -e 'type == "object"' "$VPN_CONFIG" >/dev/null 2>&1; then
+        jq --arg gw "$gateway" --argjson port "$port" --argjson sp "$socks_port" \
+           --arg user "$username" --arg pw "$password" \
+           --argjson save_pw "$want_plaintext" --argjson drop_pw "$drop_password" \
+           "$jqfilter" "$VPN_CONFIG" > "$tmp"
+    else
+        jq -n --arg gw "$gateway" --argjson port "$port" --argjson sp "$socks_port" \
+           --arg user "$username" --arg pw "$password" \
+           --argjson save_pw "$want_plaintext" --argjson drop_pw "$drop_password" \
+           "$jqfilter" > "$tmp"
+    fi \
+        || { rm -f "$tmp"; echo "Error: could not write the config." >&2; exit 1; }
+    mv "$tmp" "$VPN_CONFIG"
+    chmod 600 "$VPN_CONFIG"
+    echo ""
+    echo "Config written to $VPN_CONFIG"
+
+    if [[ "$save_in_keyring" == "true" ]]; then
+        if printf '%s' "$password" | password_set --stdin >/dev/null; then
+            echo "Password stored in GNOME keyring."
+        else
+            echo "Warning: could not store the password in the keyring; it will be asked at each connect." >&2
+        fi
+    fi
+
+    # --- create the VM ---
+    if limactl list -q 2>/dev/null | grep -q "^${VM_NAME}$"; then
+        echo ""
+        echo "The VM '$VM_NAME' already exists."
+    else
+        echo ""
+        local rsp=""
+        read -r -p "Create the VM now? It downloads about 600 MB and takes 5–15 minutes, once. [Y/n] " rsp
+        if [[ -z "$rsp" || "$rsp" =~ ^[Yy] ]]; then
+            run_locked start || {
+                echo ""
+                echo "VM creation failed. You can retry with: vmvpn start" >&2
+                exit 1
+            }
+        else
+            echo ""
+            echo "OK — create it later with: vmvpn start"
+        fi
+    fi
+
+    # --- connect ---
+    echo ""
+    local connect_state="skipped"   # skipped | connected | failed
+    local rsp=""
+    read -r -p "Connect now? [Y/n] " rsp
+    if [[ -z "$rsp" || "$rsp" =~ ^[Yy] ]]; then
+        if limactl list 2>/dev/null | awk -v n="$VM_NAME" '$1 == n && $2 == "Running" { f=1 } END { exit !f }'; then
+            if run_locked vpn_connect; then
+                connect_state="connected"
+            else
+                connect_state="failed"
+            fi
+        else
+            echo "The VM is not running; start it first with: vmvpn start"
+        fi
+    fi
+
+    echo ""
+    case "$connect_state" in
+        connected)
+            echo "Connected! Browse through the VPN with: vmvpn firefox"
+            ;;
+        failed)
+            echo "The VPN connection failed (see the message above). To fix the"
+            echo "server or account, run 'vmvpn setup' again, then 'vmvpn vpn-connect'."
+            ;;
+        *)
+            echo "Setup finished. Next steps:"
+            echo "  vmvpn vpn-connect      Connect to the VPN"
+            echo "  vmvpn firefox          Browse through the VPN"
+            echo "  vmvpn vpn-disconnect   Disconnect"
+            ;;
+    esac
+}
+
+# True when nothing is listening on local TCP port $1.
+_port_is_free() {
+    python3 - "$1" >/dev/null 2>&1 <<'EOF'
+import socket, sys
+s = socket.socket()
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)
+EOF
 }
 
 read_proxy_config() {
     check_jq
     check_vpn_config
-    if ! jq empty "$VPN_CONFIG" 2>/dev/null; then
+    if ! jq -e 'type == "object"' "$VPN_CONFIG" >/dev/null 2>&1; then
         echo "Error: VPN config file is not valid JSON: $VPN_CONFIG" >&2
         exit 5
     fi
@@ -796,6 +1064,12 @@ read_vpn_config() {
     fi
     if [[ -z "$VPN_USERNAME" || "$VPN_USERNAME" == "null" ]]; then
         echo "Error: 'username' is required in $VPN_CONFIG" >&2
+        exit 5
+    fi
+    if _is_example_placeholder "$VPN_GATEWAY" \
+       || _is_example_placeholder "$VPN_USERNAME"; then
+        echo "Error: the VPN config still has the example placeholder values: $VPN_CONFIG" >&2
+        echo "Run 'vmvpn setup' to enter your real VPN account." >&2
         exit 5
     fi
 }
@@ -919,10 +1193,11 @@ ensure_vm_running() {
 
     # Check if VM exists and is running
     if ! limactl list -q 2>/dev/null | grep -q "^${VM_NAME}$"; then
-        echo "VM not found. Creating and starting..."
+        phase "Creating the VM (first time only: downloads Ubuntu and installs FortiClient, usually 5–15 minutes)…"
         create_vm
+        phase "Waiting for the VM to become ready…"
     elif ! limactl list 2>/dev/null | grep "^${VM_NAME}" | grep -q "Running"; then
-        echo "Starting VM..."
+        phase "Starting the VM…"
         limactl start --timeout="$START_TIMEOUT" "$VM_NAME"
     fi
     apply_guest_swap || echo "Warning: could not apply guest swap settings." >&2
@@ -952,6 +1227,7 @@ vpn_connect() {
         shift
     done
 
+    phase "Checking prerequisites…"
     read_vpn_config
     resolve_vpn_password
     ensure_vm_running
@@ -992,6 +1268,7 @@ expect {
     eof
 }
 "
+    phase "Configuring the VPN profile in the guest…"
     echo "$edit_script" | limactl shell "$VM_NAME" -- expect -f - >/dev/null 2>&1
 
     # Fingerprints that can be accepted in the first attempt, avoiding a
@@ -1032,6 +1309,7 @@ expect {
     eof
 }
 "
+    phase "Connecting to $VPN_GATEWAY:$VPN_PORT…"
     connect_output=$(echo "$connect_script" | limactl shell "$VM_NAME" -- expect -f - 2>&1)
 
     # Extract fingerprint from output
@@ -1097,6 +1375,13 @@ expect {
     fi
     sed -E 's/CERT_(FINGERPRINT::[0-9A-Fa-f:]*|ACCEPTED::)//' <<<"$connect_output"
 
+    # Translate FortiClient's raw network errors into one readable line.
+    if echo "$connect_output" | grep -qiE \
+        "can ?not connect to vpn server|unable to resolve|could not resolve|name resolution|host is unreachable|no route to host|network is unreachable|timed out|connection refused"; then
+        echo ""
+        echo "Could not reach the VPN server $VPN_GATEWAY:$VPN_PORT. Check the address and your internet connection."
+    fi
+
     # Check if login failed
     if echo "$connect_output" | grep -q "Login failed"; then
         echo ""
@@ -1120,6 +1405,7 @@ expect {
     start_proxies
 
     echo ""
+    phase "Connected."
     echo "VPN connected."
     if [[ "$SOCKS_PROXY_ENABLED" == "true" ]]; then
         echo "  SOCKS5 proxy: localhost:$SOCKS_PROXY_PORT"
@@ -1363,7 +1649,7 @@ stop_socks_proxy() {
 
 start_proxies() {
     if [[ "$SOCKS_PROXY_ENABLED" == "true" && "$SOCKS_PROXY_AUTO_START" == "true" ]]; then
-        echo "Starting SOCKS5 proxy on localhost:$SOCKS_PROXY_PORT..."
+        phase "Starting the SOCKS proxy on localhost:$SOCKS_PROXY_PORT…"
         start_socks_proxy "$SOCKS_PROXY_PORT"
     fi
     
@@ -1448,6 +1734,7 @@ create_firefox_profile() {
     # Check if Firefox is installed
     if ! command -v firefox &> /dev/null; then
         echo "Error: Firefox is not installed." >&2
+        echo "Install it with your package manager, e.g.: sudo apt install firefox" >&2
         exit 1
     fi
     
@@ -1510,6 +1797,57 @@ EOF
 }
 
 launch_firefox() {
+    read_proxy_config
+    check_lima
+
+    # The VPN must be connected — otherwise every page would fail on a dead
+    # proxy.
+    local connected=false
+    if limactl list 2>/dev/null \
+       | awk -v n="$VM_NAME" '$1 == n && $2 == "Running" { f=1 } END { exit !f }' \
+       && limactl shell "$VM_NAME" -- timeout -k 5 15 \
+           /opt/forticlient/forticlient-cli vpn status 2>/dev/null \
+           | grep -q "Status: Connected"; then
+        connected=true
+    fi
+
+    if [[ "$connected" != "true" ]]; then
+        if [[ -t 0 ]]; then
+            local rsp=""
+            read -r -p "The VPN is not connected. Connect now? [Y/n] " rsp
+            if [[ -z "$rsp" || "$rsp" =~ ^[Yy] ]]; then
+                run_locked vpn_connect || {
+                    echo "Not launching Firefox." >&2
+                    exit 1
+                }
+                limactl shell "$VM_NAME" -- timeout -k 5 15 \
+                    /opt/forticlient/forticlient-cli vpn status 2>/dev/null \
+                    | grep -q "Status: Connected" \
+                    || { echo "Not launching Firefox." >&2; exit 1; }
+            else
+                echo "Not launching Firefox."
+                return 0
+            fi
+        else
+            echo "Error: the VPN is not connected. Run 'vmvpn vpn-connect' first." >&2
+            exit 1
+        fi
+    fi
+
+    # Make sure the SOCKS proxy is actually running before pointing Firefox
+    # at it.
+    if [[ "$SOCKS_PROXY_ENABLED" == "true" ]] \
+       && ! pgrep -f "ssh.*-D.*127.0.0.1:$SOCKS_PROXY_PORT.*lima-$VM_NAME" >/dev/null 2>&1; then
+        phase "Starting the SOCKS proxy on localhost:$SOCKS_PROXY_PORT…"
+        start_socks_proxy "$SOCKS_PROXY_PORT"
+    fi
+
+    if ! command -v firefox >/dev/null 2>&1; then
+        echo "Error: Firefox is not installed." >&2
+        echo "Install it with your package manager, e.g.: sudo apt install firefox" >&2
+        exit 1
+    fi
+
     local profile_path
     profile_path=$(create_firefox_profile)
     
@@ -1587,7 +1925,7 @@ _vmvpn_completions() {
     
     case "$prev" in
         vmvpn)
-            COMPREPLY=($(compgen -W "start stop restart abort settings shell ssh status delete vm-apply logs vpn-connect vpn-disconnect vpn-status password-set password-clear cert-forget firefox firefox-profile completion" -- "$cur"))
+            COMPREPLY=($(compgen -W "setup start stop restart abort settings shell ssh status delete vm-apply logs vpn-connect vpn-disconnect vpn-status password-set password-clear cert-forget firefox firefox-profile completion" -- "$cur"))
             ;;
         logs)
             COMPREPLY=($(compgen -W "vpn journal squid forticlient -n -f --follow" -- "$cur"))
@@ -1632,6 +1970,7 @@ EOF
 _vmvpn() {
     local -a commands
     commands=(
+        'setup:Interactive first-time setup'
         'start:Create and start the VM'
         'stop:Stop the VM (-f: force)'
         'restart:Restart the VM'
@@ -1736,6 +2075,9 @@ EOF
 case "${1:-}" in
     version|--version|-V)
         echo "vmvpn $VMVPN_VERSION"
+        ;;
+    setup)
+        setup
         ;;
     start)
         run_locked start
