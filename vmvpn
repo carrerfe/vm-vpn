@@ -8,9 +8,9 @@ VPN_CONFIG="${VPN_CONFIG:-$SCRIPT_DIR/vpn-config.json}"
 CERT_FINGERPRINT_FILE="$SCRIPT_DIR/.vpn-cert-fingerprint"
 FIREFOX_PROFILE_NAME="vmvpn"
 START_TIMEOUT="30m"
-VMVPN_VERSION="1.0.0"
+VMVPN_VERSION="1.1.0"
 
-COMMANDS="setup start stop restart abort settings shell ssh status delete vm-apply logs vpn-connect vpn-disconnect vpn-status password-set password-clear cert-forget firefox firefox-profile completion version"
+COMMANDS="setup start stop restart abort settings ui vm-autostart shell ssh status delete vm-apply logs vpn-connect vpn-disconnect vpn-status password-set password-clear cert-forget firefox firefox-profile completion version"
 
 usage() {
     echo "vmvpn - VM VPN CLI"
@@ -40,7 +40,14 @@ usage() {
     echo "  password-set [--stdin]   Store VPN password in GNOME keyring"
     echo "  password-clear           Remove VPN password from GNOME keyring"
     echo "  cert-forget              Forget saved VPN certificate fingerprint"
-    echo "  settings                 Open the GUI settings window"
+    echo ""
+    echo "UI Commands (the VM VPN app):"
+    echo "  ui [status|logs|settings|setup]  Open the app on a page (starts the tray too)"
+    echo "  ui stop         Stop the app (window + tray)"
+    echo "  ui tray [on|off]                 Show/stop the tray icon"
+    echo "  ui setup-prompt [on|off]         Offer setup at login until configured"
+    echo "  settings                 Open the app on the Settings page"
+    echo "  vm-autostart [on|off|run]        Start the VM at graphical login"
     echo ""
     echo "Browser Commands:"
     echo "  firefox         Launch Firefox with VPN proxy profile"
@@ -190,6 +197,58 @@ check_lima() {
 # '==> ' line as its progress text; everything else is treated as detail.
 phase() {
     echo "==> $*"
+}
+
+# The UI scripts directory: vmvpn-gui/ next to an installed vmvpn, gui/ in a
+# checkout. Used for spawning the UI and reading release.json.
+ui_gui_dir() {
+    if [[ -x "$SCRIPT_DIR/vmvpn-gui/vmvpn-window" ]]; then
+        echo "$SCRIPT_DIR/vmvpn-gui"
+    elif [[ -x "$SCRIPT_DIR/gui/vmvpn-window" ]]; then
+        echo "$SCRIPT_DIR/gui"
+    else
+        return 1
+    fi
+}
+
+# Installed release metadata: "<commit>, <ref>, installed <date>" from
+# vmvpn-gui/release.json, or "git <describe>" in a checkout. 1 when unknown.
+release_info() {
+    local gui_dir="" rf=""
+    gui_dir=$(ui_gui_dir 2>/dev/null || true)
+    [[ -n "$gui_dir" ]] && rf="$gui_dir/release.json"
+    if [[ -n "$rf" && -f "$rf" ]] && command -v jq >/dev/null 2>&1; then
+        jq -r '"\(.commit // "unknown"), \(.ref // "unknown"), installed \(.installed_at // "unknown")"' \
+            "$rf" 2>/dev/null && return 0
+    fi
+    if command -v git >/dev/null 2>&1 \
+       && git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        local desc
+        desc=$(git -C "$SCRIPT_DIR" describe --tags --always --dirty 2>/dev/null || true)
+        [[ -n "$desc" ]] && { echo "git $desc"; return 0; }
+    fi
+    return 1
+}
+
+# status_json release object: release.json contents, a git describe fallback
+# in a checkout, or null.
+release_json_value() {
+    local gui_dir="" rf=""
+    gui_dir=$(ui_gui_dir 2>/dev/null || true)
+    [[ -n "$gui_dir" ]] && rf="$gui_dir/release.json"
+    if [[ -n "$rf" && -f "$rf" ]] && command -v jq >/dev/null 2>&1; then
+        jq -c '.' "$rf" 2>/dev/null && return 0
+    fi
+    if command -v git >/dev/null 2>&1 \
+       && git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        local desc ref
+        desc=$(git -C "$SCRIPT_DIR" describe --tags --always --dirty 2>/dev/null || true)
+        ref=$(git -C "$SCRIPT_DIR" branch --show-current 2>/dev/null || true)
+        jq -nc --arg c "$desc" --arg r "$ref" --arg s "git" \
+            '{version: null, commit: $c, ref: $r, source: $s, installed_at: null}' \
+            && return 0
+    fi
+    echo "null"
 }
 
 check_jq() {
@@ -676,6 +735,23 @@ status_json() {
         cert_fp=$(cat "$CERT_FINGERPRINT_FILE")
     fi
 
+    # --- UI processes / preferences ---
+    local ui_tray_enabled=false ui_tray_running=false ui_window_running=false
+    local ui_setup_prompt=false vm_autostart=false
+    ui_pref_get tray true && ui_tray_enabled=true
+    ui_pref_get setup_prompt true && ui_setup_prompt=true
+    ui_process_running "$UI_TRAY_BUS" && ui_tray_running=true
+    ui_process_running "$UI_WINDOW_BUS" && ui_window_running=true
+    [[ -f "$VM_AUTOSTART_FILE" ]] && vm_autostart=true
+    local ui_json
+    ui_json=$(jq -nc \
+        --argjson te "$ui_tray_enabled" --argjson tr "$ui_tray_running" \
+        --argjson wr "$ui_window_running" --argjson sp "$ui_setup_prompt" \
+        '{tray_enabled: $te, tray_running: $tr, window_running: $wr,
+          setup_prompt: $sp}')
+    local release_json
+    release_json=$(release_json_value)
+
     jq -n \
         --arg ver "$VMVPN_VERSION" \
         --argjson busy "$busy" \
@@ -701,6 +777,9 @@ status_json() {
         --arg pwSource "$password_source" \
         --arg certPath "$CERT_FINGERPRINT_FILE" \
         --arg certFp "$cert_fp" \
+        --argjson ui "$ui_json" \
+        --argjson vmAutostart "$vm_autostart" \
+        --argjson release "$release_json" \
         '{
             schema: 1,
             version: $ver,
@@ -727,7 +806,10 @@ status_json() {
             cert: {
                 path: $certPath,
                 fingerprint: (if $certFp == "" then null else $certFp end)
-            }
+            },
+            ui: $ui,
+            vm_autostart: $vmAutostart,
+            release: $release
         }'
 }
 
@@ -763,6 +845,8 @@ delete_impl() {
         fi
     fi
     limactl delete -f "$VM_NAME" 2>/dev/null || echo "VM does not exist."
+    # The VM is gone — drop the login autostart for it too.
+    rm -f "$VM_AUTOSTART_FILE"
     echo "VM deleted."
 }
 
@@ -1510,21 +1594,328 @@ cert_forget() {
 }
 
 # Launch the GUI settings window, detached.
-open_settings() {
-    local win="" c
-    for c in "$SCRIPT_DIR/gui/vmvpn-window" "$SCRIPT_DIR/vmvpn-window"; do
-        if [[ -x "$c" ]]; then win="$c"; break; fi
-    done
-    if [[ -z "$win" ]]; then
-        win=$(command -v vmvpn-window 2>/dev/null || true)
+# -- UI (tray + window processes) ----------------------------------------------
+# From the user's point of view the UI is a single component managed through
+# `vmvpn`; vmvpn-tray / vmvpn-window are internal details. Preferences live in
+# ui.json; autostart entries and starting/stopping the processes are handled
+# here only — the GUI calls back into these commands.
+UI_PREFS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/vmvpn/ui.json"
+UI_LOG_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/vmvpn/ui.log"
+TRAY_AUTOSTART_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/vmvpn-tray.desktop"
+VM_AUTOSTART_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/vmvpn-vm.desktop"
+UI_TRAY_BUS="io.github.carrerfe.VmVpn.Tray"
+UI_TRAY_OBJECT="/io/github/carrerfe/VmVpn/Tray"
+UI_WINDOW_BUS="io.github.carrerfe.VmVpn"
+UI_WINDOW_OBJECT="/io/github/carrerfe/VmVpn"
+
+# ui_pref_get <key> <default> → 0 when the pref is on. A missing file or key
+# means the default.
+ui_pref_get() {
+    local key="$1" default="$2" val=""
+    if [[ -f "$UI_PREFS_FILE" ]] && command -v jq >/dev/null 2>&1; then
+        val=$(jq -r --arg k "$key" \
+            'if (.[$k] | type) == "boolean" then .[$k] else "UNSET" end' \
+            "$UI_PREFS_FILE" 2>/dev/null || true)
     fi
-    if [[ -z "$win" || ! -x "$win" ]]; then
-        echo "Error: vmvpn-window not found (install the GUI, see README)." >&2
+    case "$val" in
+        true)  return 0 ;;
+        false) return 1 ;;
+        *)     [[ "$default" == "true" ]] ;;
+    esac
+}
+
+# ui_pref_set <key> <true|false> — preserves unknown keys in ui.json.
+ui_pref_set() {
+    local key="$1" value="$2"
+    mkdir -p "$(dirname "$UI_PREFS_FILE")"
+    local tmp
+    tmp=$(mktemp) || return 1
+    if [[ -f "$UI_PREFS_FILE" ]] \
+       && jq -e 'type == "object"' "$UI_PREFS_FILE" >/dev/null 2>&1; then
+        jq --arg k "$key" --argjson v "$value" \
+            '.[$k] = $v' "$UI_PREFS_FILE" > "$tmp"
+    else
+        jq -n --arg k "$key" --argjson v "$value" '{($k): $v}' > "$tmp"
+    fi \
+        || { rm -f "$tmp"; echo "Error: could not write $UI_PREFS_FILE" >&2; return 1; }
+    mv "$tmp" "$UI_PREFS_FILE"
+}
+
+ui_has_display() {
+    [[ -n "${WAYLAND_DISPLAY:-}" || -n "${DISPLAY:-}" ]]
+}
+
+# 0 when the GApplication name $1 is owned on the session bus. Falls back to
+# pgrep on the script path when gdbus is unavailable.
+ui_process_running() {
+    local name="$1"
+    if command -v gdbus >/dev/null 2>&1; then
+        gdbus call --session --dest org.freedesktop.DBus \
+            --object-path /org/freedesktop/DBus \
+            --method org.freedesktop.DBus.NameHasOwner "$name" 2>/dev/null \
+            | grep -q "true" && return 0
+        return 1
+    fi
+    local gui_dir
+    gui_dir=$(ui_gui_dir 2>/dev/null) || return 1
+    case "$name" in
+        "$UI_TRAY_BUS")   pgrep -f "$gui_dir/vmvpn-tray" >/dev/null ;;
+        "$UI_WINDOW_BUS") pgrep -f "$gui_dir/vmvpn-window" >/dev/null ;;
+        *)                return 1 ;;
+    esac
+}
+
+# Spawn a GUI script detached: own session, stdin closed, output to ui.log.
+ui_spawn() {
+    local script="$1"; shift
+    local gui_dir
+    gui_dir=$(ui_gui_dir) || {
+        echo "Error: the VM VPN app is not installed (no vmvpn-gui/ next to vmvpn)." >&2
+        return 1
+    }
+    mkdir -p "$(dirname "$UI_LOG_FILE")"
+    setsid "$gui_dir/$script" "$@" </dev/null >>"$UI_LOG_FILE" 2>&1 &
+    disown 2>/dev/null || true
+}
+
+# Quit a running GApplication via its 'quit' action; TERM the script path
+# when the D-Bus call does not reach it.
+ui_stop_process() {
+    local bus="$1" object="$2" script="$3" i
+    if command -v gdbus >/dev/null 2>&1; then
+        gdbus call --session --dest "$bus" --object-path "$object" \
+            --method org.freedesktop.Application.ActivateAction \
+            "quit" "@av []" "{}" >/dev/null 2>&1 || true
+        i=0
+        while ui_process_running "$bus" && (( i < 20 )); do
+            sleep 0.1
+            i=$((i + 1))
+        done
+    fi
+    if ui_process_running "$bus"; then
+        local gui_dir
+        gui_dir=$(ui_gui_dir 2>/dev/null) \
+            && pkill -f "$gui_dir/$script" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# Quote an Exec value per the Desktop Entry spec: wrap in double quotes,
+# backslash-escape " ` $ \
+desktop_exec_quote() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//\`/\\\`}"
+    value="${value//\$/\\\$}"
+    printf '"%s"' "$value"
+}
+
+# The tray autostart entry runs 'vmvpn ui --login': a single launch path that
+# respects the ui.json preferences.
+ui_write_tray_autostart() {
+    mkdir -p "$(dirname "$TRAY_AUTOSTART_FILE")"
+    cat > "$TRAY_AUTOSTART_FILE" <<EOF
+[Desktop Entry]
+Type=Application
+Name=VM VPN Tray
+Exec=$(desktop_exec_quote "$SCRIPT_DIR/vmvpn") ui --login
+Icon=network-vpn
+X-GNOME-Autostart-enabled=true
+EOF
+}
+
+# Automatic autostart maintenance only happens from the installed layout
+# ($SCRIPT_DIR/vmvpn-gui/): a checkout must never touch the user's login
+# entries, and `vmvpn ui` from a checkout must not hijack them either.
+ui_migrate_tray_autostart() {
+    [[ -d "$SCRIPT_DIR/vmvpn-gui" ]] || return 0
+    if [[ ! -f "$TRAY_AUTOSTART_FILE" ]]; then
+        # Create the entry when the tray is enabled but none exists (e.g.
+        # after a headless install).
+        ui_pref_get tray true && ui_write_tray_autostart
+        return 0
+    fi
+    grep -q "ui --login" "$TRAY_AUTOSTART_FILE" && return 0
+    # Rewrite only a pre-1.1 entry that launched *this* install's vmvpn-tray;
+    # entries pointing at other installs are left alone.
+    grep -qF "$SCRIPT_DIR" "$TRAY_AUTOSTART_FILE" || return 0
+    grep -q "vmvpn-tray" "$TRAY_AUTOSTART_FILE" || return 0
+    ui_write_tray_autostart
+    echo "Migrated the tray autostart entry to 'vmvpn ui --login'."
+}
+
+# vmvpn ui [status|logs|settings|setup]: start the tray when enabled, then
+# open or present the window on the page. Returns immediately.
+ui_open() {
+    local page="${1:-status}"
+    if ! ui_has_display; then
+        echo "Error: no graphical session (DISPLAY/WAYLAND_DISPLAY unset)." >&2
+        echo "The VM VPN app needs a desktop session; the vmvpn CLI works" >&2
+        echo "without one." >&2
         exit 1
     fi
-    setsid "$win" --page settings >/dev/null 2>&1 &
-    echo "Opening VM VPN settings..."
+    ui_migrate_tray_autostart
+    if ui_pref_get tray true && ! ui_process_running "$UI_TRAY_BUS"; then
+        ui_spawn vmvpn-tray
+    fi
+    ui_spawn vmvpn-window --page "$page"
 }
+
+# Autostart entry point: tray if enabled; the setup assistant when there is
+# no usable VPN config and the prompt is still on.
+ui_login() {
+    ui_has_display || return 0
+    ui_migrate_tray_autostart
+    if ui_pref_get tray true && ! ui_process_running "$UI_TRAY_BUS"; then
+        ui_spawn vmvpn-tray
+    fi
+    if ! vpn_config_usable && ui_pref_get setup_prompt true; then
+        ui_spawn vmvpn-window --page setup
+    fi
+    return 0
+}
+
+ui_stop() {
+    ui_stop_process "$UI_WINDOW_BUS" "$UI_WINDOW_OBJECT" vmvpn-window
+    ui_stop_process "$UI_TRAY_BUS" "$UI_TRAY_OBJECT" vmvpn-tray
+    echo "VM VPN app stopped."
+}
+
+ui_tray() {
+    case "${1:-}" in
+        on)
+            ui_pref_set tray true
+            ui_write_tray_autostart
+            if ! ui_process_running "$UI_TRAY_BUS" && ui_has_display; then
+                ui_spawn vmvpn-tray
+            fi
+            echo "Tray icon: enabled."
+            echo "Autostart entry: $TRAY_AUTOSTART_FILE"
+            ;;
+        off)
+            ui_pref_set tray false
+            if [[ -f "$TRAY_AUTOSTART_FILE" ]]; then
+                rm -f "$TRAY_AUTOSTART_FILE"
+                echo "Removed autostart entry: $TRAY_AUTOSTART_FILE"
+            fi
+            ui_stop_process "$UI_TRAY_BUS" "$UI_TRAY_OBJECT" vmvpn-tray
+            echo "Tray icon: disabled."
+            ;;
+        "")
+            local state="disabled" running="not running"
+            ui_pref_get tray true && state="enabled"
+            ui_process_running "$UI_TRAY_BUS" && running="running"
+            echo "Tray icon: $state ($running)"
+            ;;
+        *)
+            echo "Usage: vmvpn ui tray [on|off]" >&2
+            exit 1
+            ;;
+    esac
+}
+
+ui_setup_prompt() {
+    case "${1:-}" in
+        on|off)
+            local json=true
+            [[ "$1" == off ]] && json=false
+            ui_pref_set setup_prompt "$json" && echo "Setup prompt: $1."
+            ;;
+        "")
+            if ui_pref_get setup_prompt true; then
+                echo "Setup prompt: enabled"
+            else
+                echo "Setup prompt: disabled"
+            fi
+            ;;
+        *)
+            echo "Usage: vmvpn ui setup-prompt [on|off]" >&2
+            exit 1
+            ;;
+    esac
+}
+
+ui() {
+    ui_migrate_tray_autostart
+    case "${1:-status}" in
+        --login)        ui_login ;;
+        stop)           ui_stop ;;
+        tray)           ui_tray "${2:-}" ;;
+        setup-prompt)   ui_setup_prompt "${2:-}" ;;
+        status|logs|settings|setup) ui_open "$1" ;;
+        "")             ui_open status ;;
+        *)
+            echo "Error: unknown 'ui' subcommand: $1" >&2
+            echo "Usage: vmvpn ui [status|logs|settings|setup|stop|tray|setup-prompt]" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# -- VM autostart (start the VM at graphical login) ----------------------------
+
+vm_autostart() {
+    case "${1:-}" in
+        on)
+            if ! command -v limactl >/dev/null 2>&1 \
+               || ! limactl list -q 2>/dev/null | grep -qx "$VM_NAME"; then
+                echo "Error: the VM '$VM_NAME' does not exist." >&2
+                echo "Create the VM first: vmvpn setup, or vmvpn start." >&2
+                exit 1
+            fi
+            mkdir -p "$(dirname "$VM_AUTOSTART_FILE")"
+            cat > "$VM_AUTOSTART_FILE" <<EOF
+[Desktop Entry]
+Type=Application
+Name=VM VPN virtual machine
+Exec=$(desktop_exec_quote "$SCRIPT_DIR/vmvpn") vm-autostart run
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=10
+EOF
+            echo "VM autostart enabled — '$VM_NAME' starts at login."
+            echo "Autostart entry: $VM_AUTOSTART_FILE"
+            ;;
+        off)
+            if [[ -f "$VM_AUTOSTART_FILE" ]]; then
+                rm -f "$VM_AUTOSTART_FILE"
+                echo "Removed autostart entry: $VM_AUTOSTART_FILE"
+            fi
+            echo "VM autostart disabled."
+            ;;
+        run)
+            vm_autostart_run
+            ;;
+        "")
+            if [[ -f "$VM_AUTOSTART_FILE" ]]; then
+                echo "VM autostart: enabled"
+            else
+                echo "VM autostart: disabled"
+            fi
+            ;;
+        *)
+            echo "Usage: vmvpn vm-autostart [on|off|run]" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# Runs at login (autostart entry): start the VM when it exists and is
+# stopped. Never creates a VM; exits 0 when there is nothing to do.
+vm_autostart_run() {
+    local log="${XDG_STATE_HOME:-$HOME/.local/state}/vmvpn/vm-autostart.log"
+    mkdir -p "$(dirname "$log")"
+    command -v limactl >/dev/null 2>&1 || exit 0
+    limactl list -q 2>/dev/null | grep -qx "$VM_NAME" || exit 0
+    limactl list 2>/dev/null \
+        | awk -v n="$VM_NAME" '$1 == n && $2 == "Running" { f=1 } END { exit !f }' \
+        && exit 0
+    {
+        echo "=== $(date '+%F %T') starting '$VM_NAME' at login ==="
+        run_locked start
+    } >> "$log" 2>&1
+}
+
 
 logs() {
     local source="${1:-}"
@@ -1925,7 +2316,13 @@ _vmvpn_completions() {
     
     case "$prev" in
         vmvpn)
-            COMPREPLY=($(compgen -W "setup start stop restart abort settings shell ssh status delete vm-apply logs vpn-connect vpn-disconnect vpn-status password-set password-clear cert-forget firefox firefox-profile completion" -- "$cur"))
+            COMPREPLY=($(compgen -W "setup start stop restart abort settings ui vm-autostart shell ssh status delete vm-apply logs vpn-connect vpn-disconnect vpn-status password-set password-clear cert-forget firefox firefox-profile completion" -- "$cur"))
+            ;;
+        ui)
+            COMPREPLY=($(compgen -W "status logs settings setup stop tray setup-prompt" -- "$cur"))
+            ;;
+        vm-autostart)
+            COMPREPLY=($(compgen -W "on off run" -- "$cur"))
             ;;
         logs)
             COMPREPLY=($(compgen -W "vpn journal squid forticlient -n -f --follow" -- "$cur"))
@@ -1975,7 +2372,9 @@ _vmvpn() {
         'stop:Stop the VM (-f: force)'
         'restart:Restart the VM'
         'abort:Kill a stuck vmvpn operation'
-        'settings:Open the GUI settings window'
+        'settings:Open the app on the Settings page'
+        'ui:Open/manage the VM VPN app'
+        'vm-autostart:Start the VM at graphical login'
         'shell:Open a shell in the VM'
         'ssh:Connect via SSH'
         'status:Show VM status'
@@ -2024,8 +2423,26 @@ _vmvpn() {
         '--force:Abort stuck ops and delete without confirmation'
     )
     password_set_opts=('--stdin:Read password from stdin')
+    local -a ui_opts vm_autostart_opts
+    ui_opts=(
+        'status:Open the Status page' 'logs:Open the Logs page'
+        'settings:Open the Settings page' 'setup:Run the setup assistant'
+        'stop:Stop the app (window + tray)'
+        'tray:Show/stop the tray icon (on|off)'
+        'setup-prompt:Setup prompt at login (on|off)'
+    )
+    vm_autostart_opts=(
+        'on:Start the VM at login' 'off:Do not start the VM at login'
+        'run:Autostart entry point'
+    )
 
     case "$words[2]" in
+        ui)
+            _describe 'subcommand' ui_opts
+            ;;
+        vm-autostart)
+            _describe 'subcommand' vm_autostart_opts
+            ;;
         completion)
             _describe 'shell' completion_shells
             ;;
@@ -2074,7 +2491,11 @@ EOF
 
 case "${1:-}" in
     version|--version|-V)
-        echo "vmvpn $VMVPN_VERSION"
+        line="vmvpn $VMVPN_VERSION"
+        if rel=$(release_info); then
+            line="$line ($rel)"
+        fi
+        echo "$line"
         ;;
     setup)
         setup
@@ -2092,7 +2513,13 @@ case "${1:-}" in
         abort
         ;;
     settings)
-        open_settings
+        ui settings
+        ;;
+    ui)
+        ui "${@:2}"
+        ;;
+    vm-autostart)
+        vm_autostart "${@:2}"
         ;;
     shell)
         shell

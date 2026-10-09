@@ -16,7 +16,6 @@ from gi.repository import Adw, Gio, GLib, GObject, Gtk
 import vmvpn_common as vc
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-TRAY_PATH = os.path.join(SCRIPT_DIR, "vmvpn-tray")
 ICON_DIR = os.path.join(SCRIPT_DIR, "icons")
 POLL_SECONDS = 5
 GUEST_LOG_SECONDS = 10
@@ -1072,10 +1071,18 @@ class SettingsPage(Gtk.Box):
 
         # Startup ------------------------------------------------------------------
         start_group = Adw.PreferencesGroup(title="Startup")
-        self.startup_row = Adw.SwitchRow(title="Start tray icon at login")
-        self.startup_row.set_active(vc.autostart_enabled())
-        self.startup_row.connect("notify::active", self._on_startup_toggled)
-        start_group.add(self.startup_row)
+        self.tray_row = Adw.SwitchRow(
+            title="Show tray icon",
+            subtitle="Show the VM VPN icon in the tray, including at login",
+        )
+        self.tray_row.set_active(True)
+        self.tray_row.connect("notify::active", self._on_tray_toggled)
+        start_group.add(self.tray_row)
+        self.vm_autostart_row = Adw.SwitchRow(title="Start the VM at login")
+        self.vm_autostart_row.connect(
+            "notify::active", self._on_vm_autostart_toggled
+        )
+        start_group.add(self.vm_autostart_row)
         setup_row = Adw.ActionRow(
             title="Setup assistant",
             subtitle="Configure the VPN account and create the VM",
@@ -1283,8 +1290,21 @@ class SettingsPage(Gtk.Box):
         fp = ((status or {}).get("cert") or {}).get("fingerprint")
         self.cert_row.set_subtitle(str(fp) if fp else "None saved")
 
+        ui = (status or {}).get("ui") or {}
         vm = (status or {}).get("vm") or {}
         busy = bool(_busy)
+        self._filling = True
+        if "tray_enabled" in ui:
+            self.tray_row.set_active(bool(ui.get("tray_enabled")))
+        self.vm_autostart_row.set_active(
+            bool((status or {}).get("vm_autostart"))
+        )
+        self._filling = False
+        vm_exists = bool(vm.get("exists"))
+        self.vm_autostart_row.set_sensitive(vm_exists)
+        self.vm_autostart_row.set_subtitle(
+            "" if vm_exists else "Create the VM first"
+        )
         self.abort_row.set_sensitive(busy)
         pending = bool((status or {}).get("vm_pending_restart"))
         self.vm_apply_row.set_subtitle(
@@ -1542,13 +1562,31 @@ class SettingsPage(Gtk.Box):
 
     # -- startup -----------------------------------------------------------------------
 
-    def _on_startup_toggled(self, row, _param):
+    def _on_tray_toggled(self, row, _param):
         if self._filling:
             return
-        try:
-            vc.set_autostart(row.get_active(), TRAY_PATH)
-        except OSError as exc:
-            self.win.toast("Autostart failed: %s" % exc)
+
+        def done(rc, _out, err):
+            if rc != vc.EXIT_OK:
+                self.win.toast(
+                    "Tray setting failed: %s"
+                    % (_last_line(err) or "exit %s" % rc)
+                )
+
+        vc.set_tray_enabled(row.get_active(), done)
+
+    def _on_vm_autostart_toggled(self, row, _param):
+        if self._filling:
+            return
+
+        def done(rc, _out, err):
+            if rc != vc.EXIT_OK:
+                self.win.toast(
+                    "VM autostart failed: %s"
+                    % (_last_line(err) or "exit %s" % rc)
+                )
+
+        vc.set_vm_autostart(row.get_active(), done)
 
     # -- delete -----------------------------------------------------------------------
 
@@ -1732,6 +1770,14 @@ class SetupAssistant(Adw.Window):
         self.nav = Adw.NavigationView()
         self.set_content(self.nav)
         self.nav.push(self._page_welcome())
+        self.connect("close-request", self._on_close_request)
+
+    def _on_close_request(self, *_args):
+        # "Don't show this again" on the Welcome page turns the login-time
+        # setup prompt off via the CLI (the CLI owns ui.json).
+        if self.dont_show.get_active():
+            vc.set_setup_prompt(False)
+        return False
 
     # -- helpers ---------------------------------------------------------------
 
@@ -1793,6 +1839,16 @@ class SetupAssistant(Adw.Window):
         box.append(self.check_group)
 
         self.check_rows = []
+
+        self.dont_show = Gtk.CheckButton(
+            label="Don't show this again",
+            tooltip_text=(
+                "The assistant opens automatically while the VPN is not "
+                "configured. Check this to stop that."
+            ),
+        )
+        self.dont_show.set_halign(Gtk.Align.START)
+        box.append(self.dont_show)
 
         again = Gtk.Button(label="Check again")
         again.connect("clicked", lambda *_: self._populate_checks())
@@ -2152,9 +2208,23 @@ class SetupAssistant(Adw.Window):
             "VM VPN window and the tray icon."
         )
         group.add(row)
-        self.tray_row = Adw.SwitchRow(title="Show the tray icon at login")
+        self.tray_row = Adw.SwitchRow(
+            title="Show tray icon",
+            subtitle="Show the VM VPN icon in the tray, including at login",
+        )
         self.tray_row.set_active(True)
+        self.tray_row.connect("notify::active", self._on_done_tray)
         group.add(self.tray_row)
+        vm_exists = bool(
+            ((self.win.status or {}).get("vm") or {}).get("exists")
+        )
+        self.vm_start_row = Adw.SwitchRow(
+            title="Start the VM at login",
+            subtitle="" if vm_exists else "Create the VM first",
+        )
+        self.vm_start_row.set_sensitive(vm_exists)
+        self.vm_start_row.connect("notify::active", self._on_done_vm_start)
+        group.add(self.vm_start_row)
         box.append(group)
 
         close_btn = Gtk.Button(label="Close")
@@ -2165,33 +2235,13 @@ class SetupAssistant(Adw.Window):
         actions = self._actions_box(close_btn, connect_btn)
         return self._page("Done", box, actions)
 
-    def _apply_tray_pref(self):
-        enabled = self.tray_row.get_active()
-        try:
-            vc.set_autostart(enabled, TRAY_PATH)
-        except OSError:
-            pass
-        if enabled:
-            # Start the tray now if it isn't running.
-            try:
-                import subprocess as _sp
+    def _on_done_tray(self, row, _param):
+        vc.set_tray_enabled(row.get_active())
 
-                running = _sp.run(
-                    ["pgrep", "-f", "vmvpn-tray"],
-                    capture_output=True,
-                ).returncode == 0
-                if not running and os.access(TRAY_PATH, os.X_OK):
-                    _sp.Popen(
-                        [TRAY_PATH],
-                        stdin=_sp.DEVNULL, stdout=_sp.DEVNULL,
-                        stderr=_sp.DEVNULL,
-                        start_new_session=True,
-                    )
-            except OSError:
-                pass
+    def _on_done_vm_start(self, row, _param):
+        vc.set_vm_autostart(row.get_active())
 
     def _on_done_connect(self, *_args):
-        self._apply_tray_pref()
         password, self.password = self.password, None
         self.close()
         self.win._start_connect(password=password)
@@ -2290,9 +2340,13 @@ class MainWindow(Adw.ApplicationWindow):
         if self.status is None:
             return
         cfg = self._cfg()
-        if not (cfg.get("exists") and cfg.get("valid")):
-            self._assistant_shown = True
-            self.open_assistant()
+        if cfg.get("exists") and cfg.get("valid"):
+            return
+        ui = (self.status or {}).get("ui") or {}
+        if not ui.get("setup_prompt", True):
+            return
+        self._assistant_shown = True
+        self.open_assistant()
 
     def _on_close(self, *_args):
         self.logs_page.shutdown()
@@ -2633,9 +2687,10 @@ class VmVpnApp(Adw.Application):
         cli_version = "unknown"
         if win is not None:
             cli_version = (win.status or {}).get("version") or "unknown"
-        debug_info = "CLI: %s\nCLI path: %s" % (
+        debug_info = "CLI: %s\nCLI path: %s\nVersion: %s" % (
             cli_version,
             vc.find_cli() or "not found",
+            vc.release_line(),
         )
         about = Adw.AboutWindow(
             transient_for=win,
@@ -2651,10 +2706,46 @@ class VmVpnApp(Adw.Application):
         about.present()
 
 
+_USAGE = """vmvpn-window — internal component of VM VPN (the app window).
+Do not run it directly; manage the app through the CLI:
+
+  vmvpn ui               open the app
+  vmvpn ui setup         run the setup assistant
+  vmvpn ui stop          quit the app
+
+Options:
+  --page PAGE     open on a page: status, logs, settings or setup
+  -h, --help      show this message
+  -V, --version   print the version
+"""
+
+
 def main():
-    if any(a in ("--version", "-V") for a in sys.argv[1:]):
+    args = sys.argv[1:]
+    if any(a in ("--help", "-h") for a in args):
+        print(_USAGE, end="")
+        return 0
+    if any(a in ("--version", "-V") for a in args):
         print("vmvpn-window %s" % vc.VERSION)
         return 0
+    # --page is parsed by GApplication; reject anything else unknown.
+    skip_next = False
+    for a in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if a == "--page":
+            skip_next = True
+            continue
+        if a.startswith("--page="):
+            continue
+        if a.startswith("-"):
+            sys.stderr.write(
+                "vmvpn-window: unknown option: %s\n" % a
+                + "vmvpn-window is an internal component of VM VPN —"
+                " use 'vmvpn ui' instead.\n"
+            )
+            return 2
     app = VmVpnApp()
     return app.run(sys.argv)
 

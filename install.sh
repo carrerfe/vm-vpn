@@ -11,13 +11,16 @@ set -e
 #   VMVPN_LIMA_VERSION  Lima release to install when missing (default: 2.0.3)
 #   VMVPN_SKIP_DEPS=1   Skip the system-package check entirely
 #   VMVPN_ASSUME_YES=1  Answer yes to all prompts (also usable without a tty)
-#   VMVPN_NO_LAUNCH=1   Never launch the setup window at the end
+#   VMVPN_NO_LAUNCH=1   Never launch the app at the end
+#   VMVPN_REF           Git ref for remote installs (default: main; use a tag
+#                       like v1.1.0 to install a specific release)
 
 REPO="carrerfe/vm-vpn"
 INSTALL_DIR="${VMVPN_INSTALL_DIR:-$HOME/.local/bin}"
 SOURCE_DIR="${VMVPN_SOURCE_DIR:-}"
+REF="${VMVPN_REF:-main}"
 REPO_URL="https://github.com/$REPO"
-RAW_URL="https://raw.githubusercontent.com/$REPO/main"
+RAW_URL="https://raw.githubusercontent.com/$REPO/$REF"
 GUI_DIR="$INSTALL_DIR/vmvpn-gui"
 APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 DESKTOP_FILE="$APPS_DIR/io.github.carrerfe.VmVpn.desktop"
@@ -326,9 +329,57 @@ fi
 # Make executable
 chmod +x "$INSTALL_DIR/vmvpn" "$GUI_DIR/vmvpn-tray" "$GUI_DIR/vmvpn-window"
 
-# Launcher symlinks next to the vmvpn CLI
-ln -sfn "vmvpn-gui/vmvpn-tray" "$INSTALL_DIR/vmvpn-tray"
-ln -sfn "vmvpn-gui/vmvpn-window" "$INSTALL_DIR/vmvpn-window"
+# Remove the pre-1.1 top-level launchers: only when they are the symlinks
+# this installer created (pointing into vmvpn-gui/) — never delete anything
+# the user placed there themselves.
+for old in "$INSTALL_DIR/vmvpn-tray" "$INSTALL_DIR/vmvpn-window"; do
+    if [[ -L "$old" ]] && [[ "$(readlink "$old")" == *vmvpn-gui/* ]]; then
+        rm -f "$old"
+    fi
+done
+
+# Release metadata: version/commit/ref/install date, shown by
+# `vmvpn --version` and `vmvpn status --json`.
+write_release_json() {
+    local version commit ref source installed_at
+    version=$(sed -n 's/^VMVPN_VERSION="\(.*\)"$/\1/p' \
+        "$INSTALL_DIR/vmvpn" | head -1)
+    installed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    if [[ -n "$SOURCE_DIR" ]]; then
+        source="local"
+        if command -v git >/dev/null 2>&1 \
+           && git -C "$SOURCE_DIR" rev-parse --is-inside-work-tree \
+               >/dev/null 2>&1; then
+            commit=$(git -C "$SOURCE_DIR" describe --tags --always --dirty \
+                2>/dev/null || true)
+            ref=$(git -C "$SOURCE_DIR" branch --show-current 2>/dev/null \
+                || true)
+        fi
+        commit="${commit:-local}"
+        ref="${ref:-local}"
+    else
+        source="remote"
+        ref="$REF"
+        # Best effort: resolve the ref to a commit via the GitHub API with a
+        # short timeout; "unknown" on any failure.
+        commit=$(curl -fsSL --max-time 5 \
+            "https://api.github.com/repos/$REPO/commits/$REF" 2>/dev/null \
+            | sed -n 's/^  *"sha": "\([0-9a-f]*\)".*$/\1/p' | head -1)
+        commit="${commit:-unknown}"
+    fi
+    jq -nc \
+        --arg version "${version:-unknown}" \
+        --arg ref "$ref" \
+        --arg commit "$commit" \
+        --arg source "$source" \
+        --arg installed_at "$installed_at" \
+        '{version: $version, ref: $ref, commit: $commit, source: $source,
+          installed_at: $installed_at}' > "$GUI_DIR/release.json" 2>/dev/null \
+        || printf '{"version":"%s","ref":"%s","commit":"%s","source":"%s","installed_at":"%s"}\n' \
+            "${version:-unknown}" "$ref" "$commit" "$source" "$installed_at" \
+            > "$GUI_DIR/release.json"
+}
+write_release_json
 
 # Quote an Exec value per the Desktop Entry spec: wrap in double quotes,
 # backslash-escape " ` $ \
@@ -341,23 +392,25 @@ desktop_exec_quote() {
     printf '"%s"' "$value"
 }
 
-# Desktop entry (app grid / launcher)
+# Desktop entry (app grid / launcher): the app is opened through the CLI —
+# `vmvpn ui` starts the tray (when enabled) and presents the window.
 mkdir -p "$APPS_DIR"
 cat > "$DESKTOP_FILE" <<EOF
 [Desktop Entry]
 Type=Application
 Name=VM VPN
 Comment=FortiClient VPN in a lightweight VM
-Exec=$(desktop_exec_quote "$INSTALL_DIR/vmvpn-window")
+Exec=$(desktop_exec_quote "$INSTALL_DIR/vmvpn") ui
 Icon=$GUI_DIR/icons/vmvpn-connected.svg
 Terminal=false
 Categories=Network;
 StartupNotify=true
-Actions=tray;
+StartupWMClass=io.github.carrerfe.VmVpn
+Actions=settings;
 
-[Desktop Action tray]
-Name=Start tray icon
-Exec=$(desktop_exec_quote "$INSTALL_DIR/vmvpn-tray")
+[Desktop Action settings]
+Name=Settings
+Exec=$(desktop_exec_quote "$INSTALL_DIR/vmvpn") ui settings
 EOF
 if command -v desktop-file-validate >/dev/null 2>&1; then
     desktop-file-validate "$DESKTOP_FILE" \
@@ -431,12 +484,18 @@ if [[ "$MODE" == "install" ]]; then
     fi
 fi
 
-# First run: launch the window so the setup assistant opens automatically.
+# Migrate a pre-1.1 tray autostart entry (Exec directly ran vmvpn-tray) to
+# the CLI-managed `vmvpn ui --login` entry. `ui tray` only prints status and
+# migrates the file — it never launches anything.
+"$INSTALL_DIR/vmvpn" ui tray >/dev/null 2>&1 || true
+
+# First run: enable the tray and open the app so the setup assistant shows.
 launched=false
 if [[ -z "${VMVPN_NO_LAUNCH:-}" && ! -f "$CONFIG_FILE" ]] \
    && { [[ -n "${WAYLAND_DISPLAY:-}" || -n "${DISPLAY:-}" ]]; } \
    && [[ "$GUI_MISSING" -eq 0 ]]; then
-    setsid "$INSTALL_DIR/vmvpn-window" >/dev/null 2>&1 &
+    "$INSTALL_DIR/vmvpn" ui tray on >/dev/null 2>&1 || true
+    "$INSTALL_DIR/vmvpn" ui >/dev/null 2>&1 || true
     launched=true
 fi
 
@@ -463,8 +522,7 @@ else
         echo "  Your saved certificate fingerprint was preserved."
     fi
     echo ""
-    echo "GUI: 'VM VPN' in the app grid, 'vmvpn-window' for the window,"
-    echo "'vmvpn-tray' for the tray icon."
+    echo "The app: 'VM VPN' in the app grid or 'vmvpn ui' in a terminal."
     echo ""
     echo "If the VM definition (vmvpn.yaml) changed, you may want to recreate the VM:"
     echo "  vmvpn delete && vmvpn vpn-connect"
